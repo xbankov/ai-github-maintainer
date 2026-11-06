@@ -189,7 +189,22 @@ export class FakeGitHub {
       );
       return found ? { body: found } : { status: 404, body: { message: "Not Found" } };
     }
-    if (/^\/repos\/[^/]+\/[^/]+\/installation$/.test(path) && isJwt) return { body: { id: 55 } };
+    if (/^\/repos\/[^/]+\/[^/]+\/installation$/.test(path) && isJwt) {
+      return {
+        body: {
+          id: 55,
+          permissions: {
+            contents: "write",
+            issues: "write",
+            pull_requests: "write",
+            metadata: "read",
+            actions: "read",
+            checks: "read",
+            statuses: "read",
+          },
+        },
+      };
+    }
     if (method === "POST" && path === "/app/installations/55/access_tokens" && isJwt) {
       return { status: 201, body: { token: "ghs_test", expires_at: "2099-01-01T00:00:00Z" } };
     }

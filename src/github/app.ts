@@ -159,6 +159,18 @@ export class GitHubApp {
     return data.id;
   }
 
+  /** The installation covering `repo`, with the permissions it has actually granted. */
+  async getInstallation(
+    repo: RepoRef,
+  ): Promise<{ id: number; permissions: Record<string, string> }> {
+    const { data } = await this.app.octokit.request("GET /repos/{owner}/{repo}/installation", {
+      owner: repo.owner,
+      repo: repo.name,
+    });
+    this.installationIds.set(key(repo), data.id);
+    return { id: data.id, permissions: data.permissions ?? {} };
+  }
+
   /** Octokit authenticated as the installation that covers `repo` (tokens refresh automatically). */
   async octokitFor(repo: RepoRef): Promise<Octokit> {
     return this.app.getInstallationOctokit(await this.getInstallationId(repo));
@@ -193,7 +205,12 @@ export class GitHubApp {
       const result: RepositoryCheck = { repo: key(repo), ok: false, problems: [], warnings: [] };
       results.push(result);
       try {
-        result.installationId = await this.getInstallationId(repo);
+        const installation = await this.getInstallation(repo);
+        result.installationId = installation.id;
+        // The installation must have accepted the App's permissions (e.g. after a permission change).
+        for (const problem of checkAppPermissions(installation.permissions)) {
+          result.problems.push(`installation: ${problem} (accept the App's updated permissions)`);
+        }
         const octokit = await this.octokitFor(repo);
         const { data } = await octokit.request("GET /repos/{owner}/{repo}", {
           owner: repo.owner,
