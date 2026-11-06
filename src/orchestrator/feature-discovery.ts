@@ -54,17 +54,18 @@ export async function discoverFeatures(
   const { allowed_label: allowedLabel, proposal_label: proposalLabel } = ctx.config.file.github;
 
   // Only when idle: no task in progress and no issue waiting to be worked on.
-  const busy = ctx.db
-    .select({ id: tasks.id })
-    .from(tasks)
-    .where(
-      and(
-        eq(tasks.repositoryId, repo.id),
-        notInArray(tasks.status, ["COMPLETED", "ABANDONED", "REJECTED"]),
-      ),
-    )
-    .get();
-  if (busy || (await listIssuesWithLabel(octokit, ref, allowedLabel)).length) return result;
+  const isIdle = async () =>
+    !ctx.db
+      .select({ id: tasks.id })
+      .from(tasks)
+      .where(
+        and(
+          eq(tasks.repositoryId, repo.id),
+          notInArray(tasks.status, ["COMPLETED", "ABANDONED", "REJECTED"]),
+        ),
+      )
+      .get() && !(await listIssuesWithLabel(octokit, ref, allowedLabel)).length;
+  if (!(await isIdle())) return result;
 
   // Back-pressure: never more than `feature_suggestions` open proposals.
   const open = await listIssuesWithLabel(octokit, ref, proposalLabel);
@@ -135,6 +136,11 @@ export async function discoverFeatures(
     await ctx.workspace.removeWorktree(wsRepo, { taskKey: "features" }).catch(() => undefined);
   }
   signal.throwIfAborted();
+  // Work may have started while the agent was thinking: then publish nothing.
+  if (!(await isIdle())) {
+    log.info("repository became busy; feature ideas discarded");
+    return result;
+  }
 
   for (const feature of features) {
     if (result.created.length >= budget) break;
@@ -143,20 +149,23 @@ export async function discoverFeatures(
       result.skipped.push(feature.title);
       continue;
     }
+    // Remember the idea before publishing it, so a crash can never lose the duplicate history.
+    ctx.db
+      .insert(featureFingerprints)
+      .values({ repositoryId: repo.id, fingerprint: fp, title: feature.title })
+      .onConflictDoNothing()
+      .run();
     const number = await createIssue(octokit, ref, {
       title: feature.title,
       body: renderFeatureIssue(feature),
       labels: [proposalLabel],
     });
     ctx.db
-      .insert(featureFingerprints)
-      .values({
-        repositoryId: repo.id,
-        fingerprint: fp,
-        title: feature.title,
-        githubIssueNumber: number,
-      })
-      .onConflictDoNothing()
+      .update(featureFingerprints)
+      .set({ githubIssueNumber: number })
+      .where(
+        and(eq(featureFingerprints.repositoryId, repo.id), eq(featureFingerprints.fingerprint, fp)),
+      )
       .run();
     known.add(fp);
     result.created.push(number);

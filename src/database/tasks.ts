@@ -29,6 +29,8 @@ export type TaskPatch = Partial<
     | "opencodeSessionId"
     | "sessionCursor"
     | "reviewCursor"
+    | "pendingFeedback"
+    | "cleanedAt"
     | "inputNotifiedAt"
     | "branchName"
     | "iterationCount"

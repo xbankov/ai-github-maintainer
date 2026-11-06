@@ -68,6 +68,8 @@ export class FakeOpenCode {
   withinScope = true;
   /** Feature ideas returned by feature discovery. */
   features: Array<{ title: string }> = [];
+  /** Called when feature ideas are produced (to simulate things happening meanwhile). */
+  onFeatures?: () => void;
   /** Extra files the build agent writes (path relative to the worktree → content). */
   extraFiles: Record<string, string> = {};
   private nextId = 1;
@@ -231,6 +233,7 @@ export class FakeOpenCode {
           };
         }
         if (prompt.includes("output your best ideas")) {
+          this.onFeatures?.();
           const features = this.features.map((f) => ({
             problem: "p",
             why: "w",

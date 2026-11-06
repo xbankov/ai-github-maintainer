@@ -72,16 +72,20 @@ export const featureSchema = z.object({
 export type Feature = z.infer<typeof featureSchema>;
 export const featureListSchema = z.object({ features: z.array(featureSchema).max(10) });
 
-/** Normalised title fingerprint: same idea with different wording/casing maps to the same value. */
+/**
+ * Normalised title fingerprint: the same idea with different casing, accents,
+ * punctuation or word order maps to the same value; every other word counts.
+ */
 export function featureFingerprint(title: string): string {
+  const stop = new Set(["a", "an", "the", "and", "or", "for", "to", "of", "in", "on", "with"]);
   const words = title
+    .normalize("NFKD")
+    .replace(/\p{M}/gu, "")
     .toLowerCase()
-    .replace(/[^a-z0-9 ]/g, " ")
-    .split(/\s+/)
-    .filter((w) => w.length > 2 && !["the", "and", "for", "with", "add", "support"].includes(w))
-    .sort();
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter((w) => w && !stop.has(w));
   return createHash("sha256")
-    .update([...new Set(words)].join(" "))
+    .update([...new Set(words)].sort().join(" "))
     .digest("hex");
 }
 

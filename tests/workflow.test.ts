@@ -476,6 +476,7 @@ describe("review loop (Milestone 4)", () => {
     expect(env.gh.botComments(pr).at(-1)).toContain("waiting for a maintainer to merge");
     expect(env.gh.pulls.get(pr)?.state).toBe("open");
     expect(env.gh.pulls.get(pr)?.merged).toBeFalsy();
+    expect(env.gh.http.calls.some((c) => c.url.pathname.endsWith("/merge"))).toBe(false);
     await env.cycle();
     expect(env.task(n)?.status).toBe("READY_FOR_HUMAN_MERGE");
   });
@@ -519,7 +520,7 @@ describe("review loop (Milestone 4)", () => {
     await env.cycle();
     expect(env.task(n)?.status).toBe("AWAITING_APPROVAL");
     expect(env.oc.only().agent).toBe("maintainer-plan");
-    expect(env.gh.botComments(pr).at(-1)).toContain("changes the approved scope");
+    expect(env.gh.botComments(pr).at(-1)).toContain("needs a new approval");
     env.oc.withinScope = true;
     env.oc.say(env.oc.only().id, "ok, implement it");
     await env.advance();
@@ -543,6 +544,16 @@ describe("review loop (Milestone 4)", () => {
 });
 
 describe("feature discovery (Milestone 4)", () => {
+  it("never creates more proposals than the limit", async () => {
+    const env = await setup();
+    env.app.config.file.discovery.feature_suggestions = 1;
+    env.oc.features = [{ title: "Idea one" }, { title: "Idea two" }, { title: "Idea three" }];
+    env.app.scheduler!.enqueueFeatureDiscovery();
+    await env.advance();
+    const proposals = [...env.gh.issues.values()].filter((i) => i.labels.includes("ai:proposal"));
+    expect(proposals.map((i) => i.title)).toEqual(["Idea one"]);
+  });
+
   it("suggests features when idle, skips duplicates, respects the limit, never processes them", async () => {
     const env = await setup();
     env.gh.addIssue({ title: "Existing: add dark mode" });
@@ -594,5 +605,151 @@ describe("feature discovery (Milestone 4)", () => {
       type: "feature",
       status: "AWAITING_APPROVAL",
     });
+  });
+});
+
+describe("review fixes (Milestone 4)", () => {
+  it("an issue with an open bot PR is not picked up again and keeps its label", async () => {
+    const env = await setup();
+    const { n } = await toOpenPr(env);
+    await env.cycle();
+    await env.cycle();
+    expect(env.app.db.select().from(jobs).where(eq(jobs.status, "dead")).all()).toEqual([]);
+    expect(env.app.db.select().from(tasks).all()).toHaveLength(1);
+    expect(env.gh.labelsOf(n)).toEqual(["ai:allowed", "ai:waiting-for-review"]);
+  });
+
+  it("closing the issue while the PR is open stops the work and closes the bot's PR", async () => {
+    const env = await setup();
+    const { n, pr } = await toOpenPr(env);
+    env.gh.edit(n, { state: "closed" });
+    await env.cycle();
+    expect(env.task(n)?.status).toBe("ABANDONED");
+    expect(env.gh.pulls.get(pr)?.state).toBe("closed");
+    expect(lockHolder(env.app.db, repoLockName("proj"))).toBeNull();
+  });
+
+  it("feedback after an approval in the same poll is not lost", async () => {
+    const env = await setup();
+    const { n, pr } = await toOpenPr(env);
+    env.gh.review(pr, USERS.xbankov, "APPROVED");
+    env.gh.inlineComment(pr, USERS.xbankov, "src/app.py", "one more thing");
+    await env.cycle();
+    expect(env.task(n)?.status).not.toBe("READY_FOR_HUMAN_MERGE");
+    expect(env.task(n)?.iterationCount).toBe(1);
+  });
+
+  it("does not push a review round after a human merged, then completes", async () => {
+    const env = await setup();
+    const { n, pr } = await toOpenPr(env);
+    env.gh.review(pr, USERS.xbankov, "CHANGES_REQUESTED", "rename it");
+    env.app.scheduler!.enqueueSyncs("test");
+    await env.app.processor!.runOnce(); // sync queues the review round
+    const head = env.gh.headSha(`ai/issue-${n}`);
+    env.gh.merge(pr, n); // merged before the round runs
+    await env.drain();
+    expect(env.gh.headSha(`ai/issue-${n}`)).toBe(head);
+    await env.cycle();
+    expect(env.task(n)?.status).toBe("COMPLETED");
+  });
+
+  it("recovers a review round recorded before a crash", async () => {
+    const env = await setup();
+    const { n } = await toOpenPr(env);
+    const t = env.task(n)!;
+    env.app.db
+      .update(tasks)
+      .set({
+        status: "CHANGES_REQUESTED",
+        iterationCount: 1,
+        pendingFeedback: JSON.stringify({
+          round: 1,
+          text: "- please rename",
+          fromSessionOnly: false,
+        }),
+      })
+      .where(eq(tasks.id, t.id))
+      .run();
+    await env.cycle();
+    await env.advance();
+    expect(env.task(n)).toMatchObject({ status: "PR_OPEN", pendingFeedback: null });
+    expect(env.oc.only().messages.some((m) => m.text?.includes("please rename"))).toBe(true);
+  });
+
+  it("feedback with the same timestamp as processed feedback is still handled", async () => {
+    const env = await setup();
+    const { n, pr } = await toOpenPr(env);
+    env.gh.inlineComment(pr, USERS.xbankov, "a.py", "first");
+    await env.cycle();
+    await env.advance();
+    const first = env.gh.reviewComments.get(pr)![0]!;
+    env.gh.inlineComment(pr, USERS.xbankov, "b.py", "second");
+    env.gh.reviewComments.get(pr)![1]!.created_at = first.created_at; // same second
+    await env.cycle();
+    expect(env.task(n)?.iterationCount).toBe(2);
+  });
+
+  it("retries a failed cleanup on the next sync", async () => {
+    const env = await setup();
+    const { n, pr } = await toOpenPr(env);
+    env.gh.closePr(pr);
+    env.gh.failLabelDeletes = 5;
+    await env.cycle();
+    expect(env.task(n)).toMatchObject({ status: "ABANDONED", cleanedAt: null });
+    env.gh.failLabelDeletes = 0;
+    await env.cycle();
+    if (process.env.DEBUG_CLEANUP)
+      console.log(
+        JSON.stringify(
+          env.app.db
+            .select()
+            .from(jobs)
+            .all()
+            .map((j) => [j.type, j.status, j.attempts, j.lastError?.slice(0, 160)]),
+        ),
+      );
+    expect(env.task(n)?.cleanedAt).toBeInstanceOf(Date);
+    expect(env.gh.labelsOf(n)).not.toContain("ai:allowed");
+  });
+
+  it("an approval is checked again when the first check fails", async () => {
+    const env = await setup();
+    const n = env.gh.addIssue({ title: "flaky check", labeledBy: USERS.xbankov });
+    await env.cycle();
+    let calls = 0;
+    const real = env.oc.approves;
+    env.oc.approves = (m) => {
+      calls++;
+      if (calls === 1) throw new Error("model down");
+      return real(m);
+    };
+    env.oc.say(env.oc.only().id, "ok, implement it");
+    await env.advance();
+    await env.advance();
+    expect(["APPROVED", "IMPLEMENTING", "TESTING", "PR_OPEN"]).toContain(env.task(n)?.status);
+  });
+
+  it("does not publish ideas if work started while the agent was thinking", async () => {
+    const env = await setup();
+    env.oc.features = [{ title: "Late idea" }];
+    // An issue becomes allowed while the agent works (simulated when the ideas are produced).
+    env.oc.onFeatures = () => env.gh.addIssue({ title: "urgent", labeledBy: USERS.xbankov });
+    env.app.scheduler!.enqueueFeatureDiscovery();
+    await env.advance();
+    expect([...env.gh.issues.values()].filter((i) => i.labels.includes("ai:proposal"))).toEqual([]);
+  });
+});
+
+describe("feature fingerprints", () => {
+  it("ignore case, accents, punctuation and order, but keep distinct words", async () => {
+    const { featureFingerprint } = await import("../src/orchestrator/proposal.js");
+    expect(featureFingerprint("Export songs to CSV")).toBe(
+      featureFingerprint("export: CSV songs!"),
+    );
+    expect(featureFingerprint("Vyhľadávanie piesní")).toBe(
+      featureFingerprint("vyhladavanie piesni"),
+    );
+    expect(featureFingerprint("Add UI for X")).not.toBe(featureFingerprint("Add API for X"));
+    expect(featureFingerprint("Šifrovanie")).not.toBe(featureFingerprint("Šifrovanie zálohy"));
   });
 });

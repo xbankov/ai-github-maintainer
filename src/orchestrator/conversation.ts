@@ -89,16 +89,17 @@ export async function conversationStep(
   const newHuman = messages.filter((m) => m.kind === "human" && m.created > cursor);
   const lastHuman = newHuman.at(-1);
   if (lastHuman) {
+    // The maintainer approves in their own words; a strict check decides whether they did.
+    // The cursor moves only after the check, so a failed check is retried with the same messages.
+    const approved = await isApproval(ctx, sessionId, newHuman, signal);
+    const applied = approved && (await approveInSession(ctx, task, lastHuman, signal));
     ctx.db
       .update(tasks)
       .set({ sessionCursor: new Date(lastHuman.created) })
       .where(eq(tasks.id, task.id))
       .run();
-    // The maintainer approves in their own words; a strict check decides whether they did.
-    if (await isApproval(ctx, sessionId, newHuman, signal)) {
-      if (await approveInSession(ctx, task, lastHuman, signal)) return;
-      task = ctx.task(task.id)!;
-    }
+    if (applied) return;
+    task = ctx.task(task.id)!;
   }
 
   // Whose turn is it? Pending questions mean the maintainer's, even while the loop runs.

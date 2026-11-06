@@ -54,6 +54,8 @@ export class FakeGitHub {
   repoLabels = new Set<string>();
   /** Number of upcoming comment posts that fail with HTTP 500 (failure injection). */
   failCommentPosts = 0;
+  /** Number of upcoming label removals that fail with HTTP 500. */
+  failLabelDeletes = 0;
   /** Local bare repository standing in for the GitHub remote (PR head commits come from it). */
   originPath = "";
   pulls = new Map<
@@ -414,6 +416,10 @@ export class FakeGitHub {
         return { body: issue.labels.map((name) => ({ name })) };
       }
       const del = /^\/labels\/(.+)$/.exec(rest);
+      if (method === "DELETE" && del && this.failLabelDeletes > 0) {
+        this.failLabelDeletes--;
+        return { status: 500, body: { message: "Server Error" } };
+      }
       if (method === "DELETE" && del) {
         if (!issue.labels.includes(del[1]!))
           return { status: 404, body: { message: "Label does not exist" } };

@@ -118,10 +118,18 @@ export async function implementTask(
   job: Job,
   signal: AbortSignal,
 ): Promise<void> {
-  const payload = job.payload as ImplementPayload;
-  let task = ctx.task(payload.taskId);
-  if (!task) throw new PermanentJobError(`task ${payload.taskId} not found`);
+  const stored = job.payload as ImplementPayload;
+  let task = ctx.task(stored.taskId);
+  if (!task) throw new PermanentJobError(`task ${stored.taskId} not found`);
   if (task.status !== "APPROVED" && task.status !== "IMPLEMENTING") return;
+  // A review round's feedback is stored with the task, so a recovered job still has it.
+  const pending = task.pendingFeedback
+    ? (JSON.parse(task.pendingFeedback) as { round: number; text: string })
+    : undefined;
+  const payload: ImplementPayload =
+    !stored.review && !stored.ciFix && pending && task.status === "IMPLEMENTING"
+      ? { ...stored, review: { round: pending.round, feedback: pending.text } }
+      : stored;
   const approved = approvedProposal(ctx, task);
   if (!approved || approved.row.version !== task.proposalVersion) {
     throw new PermanentJobError(
@@ -267,6 +275,17 @@ export async function implementTask(
     return;
   }
 
+  // A human may have merged or closed the PR meanwhile: then do not push (the next sync finishes the task).
+  if (current.githubPrNumber) {
+    const before = await getPullRequest(octokit, ref, current.githubPrNumber);
+    if (before.state !== "open") {
+      log.info(
+        { pr: before.number, merged: before.merged },
+        "pull request no longer open; not pushing",
+      );
+      return;
+    }
+  }
   const push = await ctx.github.createRepositoryToken(ref, { contents: "write" });
   await ctx.workspace.pushBranch(wsRepo, branch, push.token);
 
@@ -297,7 +316,7 @@ export async function implementTask(
     patch: {
       githubPrNumber: pr.number,
       ...(payload.ciFix ? { ciAttempts: payload.ciFix.round } : {}),
-      ...(payload.review ? { ciAttempts: 0 } : {}),
+      ...(payload.review ? { ciAttempts: 0, pendingFeedback: null } : {}),
     },
     details: { pr: pr.number, commit: await ctx.workspace.headCommit(wsRepo, taskKey(current)) },
   });
