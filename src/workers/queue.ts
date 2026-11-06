@@ -144,6 +144,30 @@ export function failJob(
 }
 
 /**
+ * Puts a running job back to pending for a later check without counting the
+ * attempt (used for polling, e.g. waiting for CI).
+ */
+export function deferJob(
+  db: Db,
+  job: Pick<Job, "id" | "attempts">,
+  delayMs: number,
+  now = new Date(),
+): Date {
+  const availableAt = new Date(now.getTime() + delayMs);
+  db.update(jobs)
+    .set({
+      status: "pending",
+      attempts: Math.max(0, job.attempts - 1),
+      lockedAt: null,
+      lockedBy: null,
+      availableAt,
+    })
+    .where(and(eq(jobs.id, job.id), eq(jobs.status, "running")))
+    .run();
+  return availableAt;
+}
+
+/**
  * Returns running jobs whose lease is older than `staleBefore` to pending.
  * At start-up pass `new Date()`: nothing can still be running after a restart.
  */

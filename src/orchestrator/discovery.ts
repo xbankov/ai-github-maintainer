@@ -15,7 +15,18 @@ import {
 import { canTransition } from "../orchestrator/state-machine.js";
 import type { Job } from "../workers/queue.js";
 import { enqueue, hasActiveJob } from "../workers/queue.js";
-import { ANALYZE_JOB, analyzeDedupeKey } from "./analysis.js";
+import { conversationDedupeKey, enqueueConversation, forwardIssueChange } from "./conversation.js";
+import { buildIssueChangedMessage } from "./prompts.js";
+import {
+  branchFor,
+  ciDedupeKey,
+  CI_JOB,
+  enqueueImplementation,
+  implementDedupeKey,
+  taskKey,
+} from "./implementation.js";
+import { releaseLock, repoLockName, taskLockOwner } from "../database/locks.js";
+import { closePullRequest } from "../github/pull-requests.js";
 import { handleCommandComment, unfinishedCommands } from "./approvals.js";
 import type { OrchestratorContext, Task } from "./context.js";
 import { issueFingerprint } from "./proposal.js";
@@ -23,7 +34,7 @@ import { issueFingerprint } from "./proposal.js";
 export const SYNC_JOB = "sync-repository";
 export const syncDedupeKey = (repositoryId: string) => `sync:${repositoryId}`;
 
-/** States before a pull request exists (Milestone 2 scope). */
+/** States the sync reconciles with the issue (before the pull request is up for review). */
 const PRE_PR_STATES = [
   "DISCOVERED",
   "ANALYZING",
@@ -31,9 +42,21 @@ const PRE_PR_STATES = [
   "REJECTED",
   "APPROVED",
   "FAILED",
+  "IMPLEMENTING",
+  "TESTING",
 ] as const;
-/** States that occupy one of the `issue_batch_size` analysis slots. */
-const SLOT_STATES = ["DISCOVERED", "ANALYZING", "AWAITING_APPROVAL"] as const;
+/** States in which an issue is being worked on; they occupy `issue_batch_size` slots. */
+const SLOT_STATES = [
+  "DISCOVERED",
+  "ANALYZING",
+  "AWAITING_APPROVAL",
+  "APPROVED",
+  "IMPLEMENTING",
+  "TESTING",
+  "PR_OPEN",
+  "CHANGES_REQUESTED",
+  "READY_FOR_HUMAN_MERGE",
+] as const;
 
 /** Overlap between polls so comments created during a poll are never missed. */
 const COMMENT_OVERLAP_MS = 2 * 60_000;
@@ -142,40 +165,51 @@ export async function syncRepository(
       if (await stopTask(ctx, task, allowedLabel)) result.abandoned.push(task.githubIssueNumber);
       continue;
     }
-    const changed =
-      task.issueFingerprint !== null && task.issueFingerprint !== issueFingerprint(issue);
-    if (changed && canTransition(task.status, "ANALYZING", "issue_changed")) {
-      const analysing = transitionTask(ctx.db, {
+    const fingerprint = issueFingerprint(issue);
+    const changed = task.issueFingerprint !== null && task.issueFingerprint !== fingerprint;
+    if (changed && (task.status === "ANALYZING" || task.status === "AWAITING_APPROVAL")) {
+      // Still discussing: the agent learns about the edit in the session.
+      await forwardIssueChange(ctx, task, buildIssueChangedMessage(issue), fingerprint);
+      result.reanalysed.push(issue.number);
+    } else if (changed && task.status === "REJECTED") {
+      // A declined issue that was edited gets a fresh look in its session.
+      const reopened = transitionTask(ctx.db, {
         taskId: task.id,
         to: "ANALYZING",
         trigger: "issue_changed",
-        patch: { approvedVersion: null },
       });
-      enqueueAnalysis(ctx, task);
-      await createComment(
-        octokit,
-        ref,
-        issue.number,
-        "🤖 The issue changed, so it will be analysed again. Any approval of the previous proposal no longer applies.",
-      );
-      await ctx.syncStatusLabel(analysing, issue.labels);
+      await forwardIssueChange(ctx, reopened, buildIssueChangedMessage(issue), fingerprint);
+      enqueueConversation(ctx, reopened);
       result.reanalysed.push(issue.number);
       continue;
     }
-    // Recovery: work that should be in progress but has no job (e.g. after a crash),
-    // including a stored proposal whose publication was interrupted.
-    const unpublished =
-      task.status === "AWAITING_APPROVAL" && !ctx.latestProposal(task.id)?.publishedAt;
+    // Recovery: work that should be in progress but has no job (e.g. after a crash).
     if (
-      (task.status === "DISCOVERED" || task.status === "ANALYZING" || unpublished) &&
-      !hasActiveJob(ctx.db, analyzeDedupeKey(task.id))
+      ["DISCOVERED", "ANALYZING", "AWAITING_APPROVAL"].includes(task.status) &&
+      !hasActiveJob(ctx.db, conversationDedupeKey(task.id))
     ) {
-      enqueueAnalysis(ctx, task);
+      enqueueConversation(ctx, task);
+    }
+    if (
+      (task.status === "APPROVED" || task.status === "IMPLEMENTING") &&
+      !hasActiveJob(ctx.db, implementDedupeKey(task.id))
+    ) {
+      enqueueImplementation(ctx, task);
+    }
+    if (task.status === "TESTING" && !hasActiveJob(ctx.db, ciDedupeKey(task.id))) {
+      enqueue(ctx.db, {
+        type: CI_JOB,
+        payload: { taskId: task.id },
+        repositoryId: task.repositoryId,
+        dedupeKey: ciDedupeKey(task.id),
+        maxAttempts: 5,
+      });
     }
     // Display: make the status label match the task (repairs interrupted label updates).
-    if (!hasActiveJob(ctx.db, analyzeDedupeKey(task.id))) {
-      await ctx.syncStatusLabel(task, issue.labels);
-    }
+    const busy = [conversationDedupeKey, implementDedupeKey, ciDedupeKey].some((key) =>
+      hasActiveJob(ctx.db, key(task.id)),
+    );
+    if (!busy) await ctx.syncStatusLabel(task, issue.labels);
   }
 
   // 4. Start new tasks for the oldest eligible issues, within the batch limit.
@@ -213,7 +247,7 @@ export async function syncRepository(
       taskId: task.id,
       details: { issue: issue.number },
     });
-    enqueueAnalysis(ctx, task);
+    enqueueConversation(ctx, task);
     await setStatusLabel(octokit, ref, issue.number, issue.labels, "queued");
     result.started.push(issue.number);
     slots--;
@@ -259,16 +293,6 @@ export async function syncRepository(
   return result;
 }
 
-function enqueueAnalysis(ctx: OrchestratorContext, task: Task) {
-  enqueue(ctx.db, {
-    type: ANALYZE_JOB,
-    payload: { taskId: task.id },
-    repositoryId: task.repositoryId,
-    dedupeKey: analyzeDedupeKey(task.id),
-    maxAttempts: 3,
-  });
-}
-
 /** The issue was closed or lost its allowed label: stop working on it. */
 async function stopTask(
   ctx: OrchestratorContext,
@@ -289,6 +313,22 @@ async function stopTask(
     },
   });
   await setStatusLabel(octokit, ref, issue.number, issue.labels, null);
+  // Implementation already started: free the repository, close the bot's draft PR, clean up.
+  releaseLock(ctx.db, repoLockName(task.repositoryId), taskLockOwner(task.id));
+  if (task.githubPrNumber) {
+    await closePullRequest(
+      octokit,
+      ref,
+      task.githubPrNumber,
+      "🤖 Closed: the issue was closed or is no longer allowed for the AI maintainer.",
+    );
+  }
+  if (task.branchName) {
+    const repo = ctx.repository(task.repositoryId);
+    await ctx.workspace
+      .removeWorktree(ctx.workspaceRepo(repo), { taskKey: taskKey(task), branch: branchFor(task) })
+      .catch(() => undefined);
+  }
   if (issue.state === "open") {
     await createComment(
       octokit,

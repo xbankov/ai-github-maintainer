@@ -52,9 +52,16 @@ export const tasks = sqliteTable(
     proposalVersion: integer("proposal_version").notNull().default(0),
     /** Proposal version a human approved; must equal proposalVersion to implement. */
     approvedVersion: integer("approved_version"),
+    /** The issue's OpenCode session: conversation, approval and implementation (kept). */
     opencodeSessionId: text("opencode_session_id"),
+    /** Creation time of the last session message the service has processed. */
+    sessionCursor: integer("session_cursor", { mode: "timestamp_ms" }),
+    /** When the maintainer was last notified that the session waits for input. */
+    inputNotifiedAt: integer("input_notified_at", { mode: "timestamp_ms" }),
     branchName: text("branch_name"),
     iterationCount: integer("iteration_count").notNull().default(0),
+    /** CI fix rounds used by the current implementation (bounded by max_implementation_retries). */
+    ciAttempts: integer("ci_attempts").notNull().default(0),
     /** Hash of the issue title/body/labels last analysed — detects changed issues. */
     issueFingerprint: text("issue_fingerprint"),
     lastError: text("last_error"),
@@ -161,13 +168,20 @@ export const decisions = sqliteTable(
     decision: text("decision", { enum: DECISIONS }).notNull(),
     githubUser: text("github_user").notNull(),
     githubUserId: integer("github_user_id").notNull(),
-    githubCommentId: integer("github_comment_id").notNull(),
+    /** Where the decision was made: a GitHub comment or the issue's OpenCode session. */
+    source: text("source", { enum: ["github", "opencode"] })
+      .notNull()
+      .default("github"),
+    githubCommentId: integer("github_comment_id"),
+    /** OpenCode message that carried the decision (source = opencode). */
+    sessionMessageId: text("session_message_id"),
     /** Instructions given with /ai revise. */
     instructions: text("instructions"),
     createdAt: createdAt(),
   },
   (t) => [
     uniqueIndex("decisions_comment_uq").on(t.githubCommentId),
+    uniqueIndex("decisions_session_message_uq").on(t.sessionMessageId),
     index("decisions_task_idx").on(t.taskId, t.proposalVersion),
     check("decisions_decision_ck", inList("decision", DECISIONS)),
   ],

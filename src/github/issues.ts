@@ -9,6 +9,11 @@ export const STATUS_LABELS = {
     description: "AI maintainer: allowed, waiting its turn",
   },
   running: { name: "ai:running", color: "fbca04", description: "AI maintainer: working on it" },
+  input: {
+    name: "ai:waiting-for-input",
+    color: "d93f0b",
+    description: "AI maintainer: the OpenCode session waits for a maintainer",
+  },
   waiting: {
     name: "ai:waiting-for-review",
     color: "0e8a16",

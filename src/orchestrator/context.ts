@@ -106,9 +106,15 @@ export class OrchestratorContext {
       case "APPROVED":
         return "queued";
       case "ANALYZING":
+      case "IMPLEMENTING":
+      case "TESTING":
         return "running";
       case "AWAITING_APPROVAL":
-        return this.latestProposal(task.id)?.publishedAt ? "waiting" : "running";
+        return "input";
+      case "PR_OPEN":
+      case "CHANGES_REQUESTED":
+      case "READY_FOR_HUMAN_MERGE":
+        return "waiting";
       default:
         return null;
     }

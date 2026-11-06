@@ -223,6 +223,90 @@ export class WorkspaceManager {
     return created;
   }
 
+  /** Files changed in a worktree (modified, added, deleted, untracked), relative paths. */
+  async changedFiles(repo: WorkspaceRepo, taskKey: string): Promise<string[]> {
+    const path = this.worktreeDir(repo, taskKey);
+    const out = await this.git(["status", "--porcelain=v1", "-z", "--untracked-files=all"], path);
+    const files: string[] = [];
+    const entries = out.split("\0").filter(Boolean);
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i]!;
+      const code = entry.slice(0, 2);
+      files.push(entry.slice(3));
+      if (code.startsWith("R") || code.startsWith("C")) i++; // skip the rename source
+    }
+    return files;
+  }
+
+  /** Reverts the given paths to HEAD (tracked) or deletes them (untracked). */
+  async discardPaths(repo: WorkspaceRepo, taskKey: string, files: string[]): Promise<void> {
+    if (!files.length) return;
+    const path = this.worktreeDir(repo, taskKey);
+    for (const file of files) {
+      await this.git(
+        ["restore", "--source=HEAD", "--staged", "--worktree", "--", file],
+        path,
+      ).catch(() => undefined);
+      await this.git(["clean", "-f", "-q", "--", file], path).catch(() => undefined);
+    }
+  }
+
+  /** Stages everything and commits it; returns the new commit, or null if nothing changed. */
+  async commitAll(
+    repo: WorkspaceRepo,
+    taskKey: string,
+    message: string,
+    author: { name: string; email: string },
+  ): Promise<string | null> {
+    const path = this.worktreeDir(repo, taskKey);
+    await this.git(["add", "-A"], path);
+    const staged = await this.git(["diff", "--cached", "--name-only"], path);
+    if (!staged) return null;
+    await runGit(["commit", "--no-verify", "-q", "-m", message], {
+      cwd: path,
+      timeoutMs: this.options.gitTimeoutMs,
+      env: {
+        GIT_AUTHOR_NAME: author.name,
+        GIT_AUTHOR_EMAIL: author.email,
+        GIT_COMMITTER_NAME: author.name,
+        GIT_COMMITTER_EMAIL: author.email,
+      },
+    });
+    return this.git(["rev-parse", "HEAD"], path);
+  }
+
+  /** Moves an unused task worktree to the latest fetched default branch (discards local changes). */
+  async resetToDefault(repo: WorkspaceRepo, taskKey: string): Promise<void> {
+    const path = this.worktreeDir(repo, taskKey);
+    await this.git(["reset", "-q", "--hard", `refs/remotes/origin/${repo.defaultBranch}`], path);
+    await this.git(["clean", "-fdq"], path);
+  }
+
+  async headCommit(repo: WorkspaceRepo, taskKey: string): Promise<string> {
+    return this.git(["rev-parse", "HEAD"], this.worktreeDir(repo, taskKey));
+  }
+
+  /** Number of commits on the task branch that are not on the default branch. */
+  async commitsAhead(repo: WorkspaceRepo, branch: string): Promise<number> {
+    validateBranchName(branch, repo.defaultBranch);
+    const out = await this.git(
+      ["rev-list", "--count", `refs/remotes/origin/${repo.defaultBranch}..refs/heads/${branch}`],
+      this.repoDir(repo),
+    );
+    return Number(out);
+  }
+
+  /** Pushes the task branch (never the default branch; never forced). */
+  async pushBranch(repo: WorkspaceRepo, branch: string, token: string): Promise<void> {
+    validateBranchName(branch, repo.defaultBranch);
+    await runGit(["push", "-q", "origin", `refs/heads/${branch}:refs/heads/${branch}`], {
+      cwd: this.repoDir(repo),
+      token,
+      timeoutMs: this.options.gitTimeoutMs ?? 300_000,
+    });
+    this.log.info({ repo: repo.id, branch }, "branch pushed");
+  }
+
   /** Removes a task worktree and (by default) its local branch. Idempotent. */
   async removeWorktree(
     repo: WorkspaceRepo,

@@ -1,4 +1,6 @@
-import type { Proposal } from "../src/orchestrator/proposal.js";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import type { ApprovedPlan, Proposal } from "../src/orchestrator/proposal.js";
 import { mockFetch } from "./helpers.js";
 
 export function defaultProposal(issueTitle: string, extra: Partial<Proposal> = {}): Proposal {
@@ -16,18 +18,87 @@ export function defaultProposal(issueTitle: string, extra: Partial<Proposal> = {
   };
 }
 
+export function defaultPlan(issueTitle: string, extra: Partial<ApprovedPlan> = {}): ApprovedPlan {
+  return {
+    ...defaultProposal(issueTitle),
+    differences_from_issue: ["Also covers the import path"],
+    ...extra,
+  };
+}
+
+interface FakeMessage {
+  id: string;
+  type: "user" | "assistant";
+  time: { created: number };
+  text?: string;
+  metadata?: Record<string, unknown>;
+  content?: Array<{ type: "text"; text: string }>;
+}
+
+export interface FakeSession {
+  id: string;
+  title: string;
+  directory: string;
+  agent: string;
+  permissions: unknown[];
+  messages: FakeMessage[];
+  busy: boolean;
+  questions: number;
+  interrupted: number;
+}
+
 /**
- * Fake OpenCode 2.2 server. Each session remembers its analysis prompt; the
- * JSON answer is produced by `answer(prompt)` (default: a valid proposal for
- * the issue title found in the prompt).
+ * Fake OpenCode 2.2 server with stateful sessions. By default the agent
+ * answers every prompt immediately (not busy afterwards). The build agent
+ * edits a file in the session directory, like a real implementation would.
  */
 export class FakeOpenCode {
-  sessions = new Map<string, { directory: string; agent: string; prompts: string[] }>();
-  deleted: string[] = [];
-  answer: (analysisPrompt: string, attempt: number) => string = (prompt) =>
-    JSON.stringify(defaultProposal(/#\d+: (.*)/.exec(prompt)?.[1] ?? "unknown"));
+  sessions = new Map<string, FakeSession>();
+  /** JSON returned by `generate` (the approved plan). */
+  plan: (session: FakeSession, attempt: number) => string = (s) =>
+    JSON.stringify(defaultPlan(/#\d+ — (.*)/.exec(s.title)?.[1] ?? "x"));
+  /** Whether the build agent changes files when prompted. */
+  editsFiles = true;
+  /** Extra files the build agent writes (path relative to the worktree → content). */
+  extraFiles: Record<string, string> = {};
   private nextId = 1;
+  private nextMsg = 1;
+  private clock = Date.now();
   private generateCalls = new Map<string, number>();
+
+  now(): number {
+    this.clock = Math.max(this.clock + 1, Date.now());
+    return this.clock;
+  }
+
+  /** A maintainer types a message in the OpenCode UI. */
+  say(sessionId: string, text: string, opts: { busy?: boolean } = {}): string {
+    const s = this.sessions.get(sessionId)!;
+    const id = `msg_${this.nextMsg++}`;
+    s.messages.push({ id, type: "user", time: { created: this.now() }, text });
+    s.busy = opts.busy ?? false;
+    if (!opts.busy) this.reply(s, `Answer to: ${text}`);
+    return id;
+  }
+
+  /** Moves the whole session history into the past (for inactivity timers). */
+  age(sessionId: string, ms: number): void {
+    for (const m of this.sessions.get(sessionId)!.messages) m.time.created -= ms;
+  }
+
+  only(): FakeSession {
+    const [s] = [...this.sessions.values()];
+    return s!;
+  }
+
+  private reply(s: FakeSession, text: string) {
+    s.messages.push({
+      id: `msg_${this.nextMsg++}`,
+      type: "assistant",
+      time: { created: this.now() },
+      content: [{ type: "text", text }],
+    });
+  }
 
   readonly http = mockFetch(({ method, url, body }) => {
     const p = url.pathname;
@@ -37,44 +108,97 @@ export class FakeOpenCode {
         body: { location: {}, data: [{ id: "maintainer-plan" }, { id: "maintainer-build" }] },
       };
     }
+    if (method === "GET" && p === "/api/session/active") {
+      return {
+        body: {
+          data: Object.fromEntries(
+            [...this.sessions.values()]
+              .filter((s) => s.busy)
+              .map((s) => [s.id, { type: "running" }]),
+          ),
+        },
+      };
+    }
     if (method === "POST" && p === "/api/session") {
-      const b = body as { agent: string; location: { directory: string } };
+      const b = body as {
+        agent: string;
+        title: string;
+        location: { directory: string };
+        permissions: unknown[];
+      };
       const id = `ses_${this.nextId++}`;
-      this.sessions.set(id, { directory: b.location.directory, agent: b.agent, prompts: [] });
+      this.sessions.set(id, {
+        id,
+        title: b.title,
+        directory: b.location.directory,
+        agent: b.agent,
+        permissions: b.permissions,
+        messages: [],
+        busy: false,
+        questions: 0,
+        interrupted: 0,
+      });
       return { body: { data: { id } } };
     }
     const m = /^\/api(?:\/experimental)?\/session\/([^/]+)(\/.*)?$/.exec(p);
     if (!m) return undefined;
-    const session = this.sessions.get(m[1]!);
-    if (!session) return { status: 404, body: { message: "Session not found" } };
+    const s = this.sessions.get(m[1]!);
+    if (!s) return { status: 404, body: { message: "Session not found" } };
     switch (`${method} ${m[2] ?? ""}`) {
       case "DELETE ":
-        this.deleted.push(m[1]!);
+        this.sessions.delete(s.id);
         return { status: 204 };
-      case "POST /prompt":
-        session.prompts.push((body as { text: string }).text);
+      case "PATCH ":
+        s.permissions = (body as { permissions?: unknown[] }).permissions ?? s.permissions;
+        return { status: 204 };
+      case "POST /agent":
+        s.agent = (body as { agent: string }).agent;
+        return { status: 204 };
+      case "POST /interrupt":
+        s.busy = false;
+        s.interrupted++;
+        return { body: { data: {} } };
+      case "GET /form":
+        return {
+          body: { data: Array.from({ length: s.questions }, (_, i) => ({ id: `form_${i}` })) },
+        };
+      case "POST /prompt": {
+        const b = body as { text: string; metadata?: Record<string, unknown> };
+        s.messages.push({
+          id: `msg_${this.nextMsg++}`,
+          type: "user",
+          time: { created: this.now() },
+          text: b.text,
+          metadata: b.metadata,
+        });
+        if (
+          s.agent === "maintainer-build" &&
+          this.editsFiles &&
+          !b.text.startsWith("[maintainer service]")
+        ) {
+          writeFileSync(
+            join(s.directory, `change-${this.nextMsg}.txt`),
+            `${b.text.slice(0, 40)}\n`,
+          );
+          for (const [file, content] of Object.entries(this.extraFiles)) {
+            mkdirSync(dirname(join(s.directory, file)), { recursive: true });
+            writeFileSync(join(s.directory, file), content);
+          }
+          this.reply(s, "Changed change-N.txt; test with the existing suite.");
+        } else {
+          this.reply(s, "I looked at the code. Proposed plan: …");
+        }
         return { body: { data: { id: "msg", type: "user" } } };
+      }
       case "POST /wait":
+        s.busy = false;
         return { status: 204 };
       case "GET /context":
-        return {
-          body: {
-            data: [
-              {
-                id: "a1",
-                type: "assistant",
-                time: { created: 1 },
-                agent: session.agent,
-                model: { id: "m", providerID: "p" },
-                content: [{ type: "text", text: "I reviewed the code." }],
-              },
-            ],
-          },
-        };
+        return { body: { data: s.messages } };
       case "POST /generate": {
-        const n = (this.generateCalls.get(m[1]!) ?? 0) + 1;
-        this.generateCalls.set(m[1]!, n);
-        return { body: { data: { text: this.answer(session.prompts[0] ?? "", n) } } };
+        const n = (this.generateCalls.get(s.id) ?? 0) + 1;
+        this.generateCalls.set(s.id, n);
+        return { body: { data: { text: this.plan(s, n) } } };
       }
       default:
         return undefined;

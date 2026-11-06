@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import type { IssueComment, IssueSummary } from "../github/issues.js";
-import { proposalSchema, type Proposal } from "./proposal.js";
+import { approvedPlanSchema, type Proposal } from "./proposal.js";
 
 /** prompts/ lives at the project root, next to src/ and dist/. */
 const PROMPTS_DIR = fileURLToPath(new URL("../../prompts/", import.meta.url));
@@ -53,12 +53,12 @@ function boundedComments(comments: IssueComment[]): string {
   ].join("\n\n");
 }
 
-export function buildAnalysisPrompt(input: {
+/** First message of an issue's OpenCode session. */
+export function buildConversationPrompt(input: {
   repository: string;
   instructions: string;
   issue: IssueSummary;
   comments: IssueComment[];
-  revision?: { instructions: string; previous?: Proposal; by: string };
 }): string {
   const nonce = randomBytes(6).toString("hex");
   const issue = [
@@ -69,40 +69,81 @@ export function buildAnalysisPrompt(input: {
     clip(input.issue.body || "(no description)", PROMPT_LIMITS.issueBody),
   ].join("\n");
   const comments = input.comments.length ? boundedComments(input.comments) : "(no comments)";
-  const revision = input.revision
-    ? [
-        "",
-        `## Revision requested by maintainer ${input.revision.by} (trusted)`,
-        "",
-        input.revision.instructions,
-        ...(input.revision.previous
-          ? [
-              "",
-              "Previous proposal (revise it accordingly):",
-              "```json",
-              JSON.stringify(input.revision.previous, null, 2),
-              "```",
-            ]
-          : []),
-        "",
-      ].join("\n")
-    : "";
-  return fill(template("analyze-issue.md"), {
+  return fill(template("conversation.md"), {
     repository: input.repository,
     instructions: input.instructions.trim() || "(none)",
     issue: neutralise(issue),
     comments: neutralise(comments),
-    revision,
     nonce,
   });
 }
 
-/** Asks for the final structured answer, optionally with feedback on a rejected attempt. */
-export function buildProposalJsonPrompt(previousError?: string): string {
+/** Sent into the session when the issue text changed on GitHub. */
+export function buildIssueChangedMessage(issue: IssueSummary): string {
+  const nonce = randomBytes(6).toString("hex");
   return [
-    "Now output your analysis as exactly one JSON object and nothing else — no prose, no markdown fence.",
+    "[maintainer service] The issue was edited on GitHub. Take the new text into account:",
+    "",
+    `<untrusted-${nonce}>`,
+    neutralise(
+      `#${issue.number}: ${issue.title}\n\n${clip(issue.body || "(no description)", PROMPT_LIMITS.issueBody)}`,
+    ),
+    `</untrusted-${nonce}>`,
+  ].join("\n");
+}
+
+/**
+ * Asks for the plan the maintainer just approved, as JSON, optionally with
+ * feedback on a rejected attempt.
+ */
+export function buildApprovedPlanPrompt(previousError?: string): string {
+  return [
+    "The maintainer approved. Write down the plan exactly as agreed in this conversation,",
+    "and list how it differs from the original issue description (empty list if it does not).",
+    "Output exactly one JSON object and nothing else — no prose, no markdown fence.",
     "It must validate against this JSON Schema:",
-    JSON.stringify(z.toJSONSchema(proposalSchema, { io: "input" })),
+    JSON.stringify(z.toJSONSchema(approvedPlanSchema, { io: "input" })),
     ...(previousError ? ["", "Your previous answer was rejected:", previousError, "Fix it."] : []),
   ].join("\n");
+}
+
+export function buildImplementationPrompt(input: {
+  repository: string;
+  branch: string;
+  instructions: string;
+  issue: IssueSummary;
+  proposal: Proposal;
+  version: number;
+  approvedBy: string;
+}): string {
+  const issue = [
+    `#${input.issue.number}: ${input.issue.title}`,
+    "",
+    clip(input.issue.body || "(no description)", PROMPT_LIMITS.issueBody),
+  ].join("\n");
+  return fill(template("implement-issue.md"), {
+    repository: input.repository,
+    branch: input.branch,
+    instructions: input.instructions.trim() || "(none)",
+    proposal: JSON.stringify(input.proposal, null, 2),
+    version: String(input.version),
+    approvedBy: input.approvedBy,
+    issue: neutralise(issue),
+    nonce: randomBytes(6).toString("hex"),
+  });
+}
+
+export function buildCiFixPrompt(input: {
+  round: number;
+  maxRounds: number;
+  failures: string[];
+  logs: string;
+}): string {
+  return fill(template("fix-ci.md"), {
+    round: String(input.round),
+    maxRounds: String(input.maxRounds),
+    failures: input.failures.map((f) => `- ${f}`).join("\n") || "- (unknown)",
+    logs: neutralise(clip(input.logs || "(no logs available)", PROMPT_LIMITS.comments)),
+    nonce: randomBytes(6).toString("hex"),
+  });
 }

@@ -12,27 +12,36 @@ The full requirements are in [SPEC.md](SPEC.md).
 | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | ----------- |
 | 1 — Foundation               | project setup, SQLite + migrations, GitHub App auth, configuration, OpenCode connection, workspaces, health checks, logging, Docker | ✅ done     |
 | 2 — Discovery and approval   | polling scheduler, job queue, label gate, issue analysis, proposals, `/ai` commands, status labels                                  | ✅ done     |
-| 3 — Implementation           | worktree sessions, checks, commits, PRs                                                                                             | not started |
+| 3 — Implementation           | OpenCode session per issue, approval in OpenCode, draft PR, CI in GitHub Actions with fix rounds                                    | ✅ done     |
 | 4 — Review loop and features | review iterations, merge detection, feature proposals, recovery                                                                     | not started |
 
-## How to use it on GitHub
+## How it works
 
-1. A maintainer (listed in `github.authorized_users`) adds the label **`ai-allowed`**
-   to an issue. Labels added by anyone else are ignored.
-2. Within ~5 minutes the maintainer bot picks it up (oldest first, at most
-   `issue_batch_size` per repository at a time), analyses it with the read-only
-   agent and posts a **proposal** comment (v1, v2, …).
-3. A maintainer replies on the issue (first line of the comment):
-   - `/ai approve` — approves the **current** proposal version; it is queued for
-     implementation (Milestone 3).
-   - `/ai reject` — declines; nothing is implemented.
-   - `/ai revise <what to change>` — new analysis with your guidance, new version.
-4. Editing the issue (title/body) triggers a new analysis and voids earlier
-   approvals. Removing `ai-allowed` or closing the issue stops the work.
+The OpenCode web UI is the console: every issue gets its own OpenCode session,
+where the agent and the maintainer talk privately. GitHub only gets short status
+notes, the approved plan and the pull request.
+
+1. A maintainer (listed in `github.authorized_users`) adds the label
+   **`ai:allowed`** to an issue. Labels added by anyone else are ignored.
+2. Within ~5 minutes the bot creates the OpenCode session `<repo>#<n> — <title>`
+   and comments a link to it on the issue. The agent investigates (read-only) and
+   may ask questions there.
+3. You discuss in the session. If it waits for you for 30 minutes, the bot
+   @mentions you on the issue with the session link.
+4. You approve in the session by typing **`/ai approve`** (or `/ai reject`).
+   The bot posts the approved plan on the issue, including how it differs from the
+   issue description.
+5. The same session implements the plan, the bot pushes `ai/issue-<n>` and opens a
+   **draft** pull request. CI runs in GitHub Actions; failures go back to the agent
+   (up to `max_implementation_retries` rounds).
+6. When CI passes, the PR is marked ready for review. **You review and merge.**
+
+Removing `ai:allowed` or closing the issue stops the work (a draft PR is closed).
+`/ai` comments on GitHub only get a reply with the session link.
 
 Status labels (set by the bot, display only): `ai:queued`, `ai:running`,
-`ai:waiting-for-review`. Commands from non-maintainers are ignored silently.
-The bot never merges.
+`ai:waiting-for-input` (your turn in OpenCode), `ai:waiting-for-review` (PR).
+The bot works on one issue at a time and never merges.
 
 ## Architecture
 
@@ -182,7 +191,7 @@ repository you can set `commands` (test, lint, build, format, typecheck),
 [config/repositories.example.yaml](config/repositories.example.yaml).
 
 `github.authorized_users` are the maintainers; `github.allowed_label`
-(default `ai-allowed`) is the label that enables an issue. Because only
+(default `ai:allowed`) is the label that enables an issue. Because only
 maintainer-labelled issues reach the model, public repositories are safe to use.
 `discovery.poll_interval_seconds` (default 300) sets the polling interval;
 `discovery.schedule` adds a daily full run (default 08:00).
@@ -237,7 +246,7 @@ GitHub/OpenCode are mocked at the HTTP level.
   polled every 5 minutes (configurable). Reactions take up to one interval;
   nothing is exposed to the internet. `GITHUB_WEBHOOK_SECRET` is unused.
 - **Label gate.** Issues are processed only after a maintainer adds
-  `ai-allowed` (decided with the project owner); the spec processes all open
+  `ai:allowed` (decided with the project owner); the spec processes all open
   issues.
 - **Approval with open questions.** A valid proposal with a plan can be approved
   even if it lists open questions; approving accepts the plan as written.

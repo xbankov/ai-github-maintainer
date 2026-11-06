@@ -27,8 +27,11 @@ export type TaskPatch = Partial<
     | "proposalVersion"
     | "approvedVersion"
     | "opencodeSessionId"
+    | "sessionCursor"
+    | "inputNotifiedAt"
     | "branchName"
     | "iterationCount"
+    | "ciAttempts"
     | "issueFingerprint"
     | "lastError"
   >

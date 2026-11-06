@@ -104,7 +104,7 @@ describe("repository configuration", () => {
 
   it("defaults the allowed label and polling interval", () => {
     const d = testConfig().file;
-    expect(d.github.allowed_label).toBe("ai-allowed");
+    expect(d.github.allowed_label).toBe("ai:allowed");
     expect(d.discovery.poll_interval_seconds).toBe(300);
   });
 });

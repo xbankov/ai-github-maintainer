@@ -28,6 +28,7 @@ export const TRANSITION_TRIGGERS = [
   "analysis_started",
   "analysis_completed",
   "analysis_failed",
+  "conversation_continued",
   "approve_command",
   "reject_command",
   "revise_command",
@@ -81,8 +82,9 @@ const TRANSITIONS: TransitionTable = {
   },
   AWAITING_APPROVAL: {
     APPROVED: ["approve_command"],
+    // The maintainer replied in the OpenCode session; the agent works again.
+    ANALYZING: ["revise_command", "issue_changed", "conversation_continued"],
     REJECTED: ["reject_command"],
-    ANALYZING: ["revise_command", "issue_changed"],
     ABANDONED: ["issue_closed", "manual_abandon"],
   },
   REJECTED: {
