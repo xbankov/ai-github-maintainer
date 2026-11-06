@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createApplication, type Application } from "../src/app.js";
 import { auditLog, decisions, jobs, proposals, tasks } from "../src/database/schema.js";
 import { setKillSwitch } from "../src/database/settings.js";
-import { claimNext, recoverStaleJobs } from "../src/workers/queue.js";
+import { claimNext } from "../src/workers/queue.js";
 import { FakeGitHub, TEST_PRIVATE_KEY, USERS } from "./fake-github.js";
 import { defaultProposal, FakeOpenCode } from "./fake-opencode.js";
 import { git, silentLogger, tempDir, testConfig } from "./helpers.js";
@@ -25,6 +25,14 @@ function originRepo(): string {
 }
 
 const apps: Application[] = [];
+
+async function waitFor(condition: () => boolean, timeoutMs = 15_000): Promise<void> {
+  const start = Date.now();
+  while (!condition()) {
+    if (Date.now() - start > timeoutMs) throw new Error("condition not met in time");
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
 afterEach(async () => {
   while (apps.length) await apps.pop()!.close();
 });
@@ -264,7 +272,7 @@ describe("approval commands", () => {
     const stale = gh.comment(n, USERS.xbankov, "/ai approve");
     const row = app.db.select().from(proposals).where(eq(proposals.version, 2)).get()!;
     gh.comments.find((c) => c.id === stale)!.created_at = new Date(
-      row.createdAt.getTime() - 60_000,
+      row.publishedAt!.getTime() - 60_000,
     ).toISOString();
     await cycle();
     expect(task(n)?.status).toBe("AWAITING_APPROVAL");
@@ -309,29 +317,34 @@ describe("robustness", () => {
     expect(task(n)?.status).toBe("AWAITING_APPROVAL");
   });
 
-  it("marks the task FAILED after repeated failures and allows /ai revise to retry", async () => {
+  it("marks the task FAILED only after all retries, then /ai revise retries it", async () => {
     const { app, gh, oc, cycle, drain, task } = await setup();
     oc.answer = () => "never valid";
     const n = gh.addIssue({ title: "broken", labeledBy: USERS.xbankov });
     await cycle();
-    // Retries are scheduled with backoff; make them due and run them.
-    for (let i = 0; i < 3; i++) {
+    const analysis = () => app.db.select().from(jobs).where(eq(jobs.type, "analyze-issue")).get()!;
+    // Attempt 1 failed: retried later, task still analysing.
+    expect(analysis()).toMatchObject({ status: "pending", attempts: 1 });
+    expect(task(n)?.status).toBe("ANALYZING");
+    for (const attempt of [2, 3]) {
       app.db
         .update(jobs)
         .set({ availableAt: new Date(0) })
         .where(eq(jobs.status, "pending"))
         .run();
       await drain();
+      expect(analysis().attempts).toBe(attempt);
+      expect(analysis().status).toBe(attempt < 3 ? "pending" : "dead");
     }
     expect(task(n)?.status).toBe("FAILED");
-    expect(gh.botComments(n).at(-1)).toContain("analysis failed");
+    expect(gh.botComments(n).at(-1)).toContain("analysis failed after 3 attempts");
     oc.answer = () => JSON.stringify(defaultProposal("broken"));
     gh.comment(n, USERS.xbankov, "/ai revise try again");
     await cycle();
     expect(task(n)?.status).toBe("AWAITING_APPROVAL");
   });
 
-  it("recovers an analysis interrupted by a restart", async () => {
+  it("recovers an analysis interrupted by a restart when the workers start", async () => {
     const dbPath = join(tempDir(), "db.sqlite");
     const gh = new FakeGitHub();
     const first = await setup({ dbPath, gh });
@@ -342,10 +355,10 @@ describe("robustness", () => {
     await first.app.close();
     apps.splice(apps.indexOf(first.app), 1);
 
+    // Real start-up path: JobProcessor.start() must recover and run the job by itself.
     const second = await setup({ dbPath, gh });
-    expect(recoverStaleJobs(second.app.db, new Date())).toBe(1);
-    await second.drain();
-    expect(second.task(n)?.status).toBe("AWAITING_APPROVAL");
+    second.app.processor!.start();
+    await waitFor(() => second.task(n)?.status === "AWAITING_APPROVAL");
     expect(gh.botComments(n)).toHaveLength(1);
   });
 
@@ -355,6 +368,118 @@ describe("robustness", () => {
     const n = gh.addIssue({ title: "paused", labeledBy: USERS.xbankov });
     await cycle();
     expect(task(n)).toBeUndefined();
+    expect(app.db.select().from(jobs).all()).toEqual([]); // nothing queued while paused
     expect(await app.processor!.runOnce()).toBe(false);
+  });
+});
+
+describe("review fixes", () => {
+  it("resumes a command whose reply failed, without applying it twice", async () => {
+    const { app, gh, cycle, task } = await setup();
+    const n = gh.addIssue({ title: "flaky github", labeledBy: USERS.xbankov });
+    await cycle();
+    gh.comment(n, USERS.xbankov, "/ai approve");
+    gh.failCommentPosts = 1; // the confirmation reply fails
+    await cycle();
+    expect(task(n)?.status).toBe("APPROVED"); // decision applied atomically
+    app.db
+      .update(jobs)
+      .set({ availableAt: new Date(0) })
+      .where(eq(jobs.status, "pending"))
+      .run();
+    await cycle();
+    expect(app.db.select().from(decisions).all()).toHaveLength(1);
+    expect(gh.botComments(n).filter((b) => b.includes("approved by @xbankov"))).toHaveLength(1);
+  });
+
+  it("refuses a /ai revise written before the current proposal was published", async () => {
+    const { app, gh, cycle, task } = await setup();
+    const n = gh.addIssue({ title: "late guidance", labeledBy: USERS.xbankov });
+    await cycle();
+    const id = gh.comment(n, USERS.xbankov, "/ai revise do it differently");
+    const published = app.db.select().from(proposals).get()!.publishedAt!;
+    gh.comments.find((c) => c.id === id)!.created_at = published.toISOString(); // same second
+    await cycle();
+    expect(task(n)).toMatchObject({ status: "AWAITING_APPROVAL", proposalVersion: 1 });
+    expect(gh.botComments(n).at(-1)).toContain("send your guidance again");
+  });
+
+  it("discards a result when the issue changed during analysis, then analyses the new text", async () => {
+    const { app, gh, oc, cycle, drain, task } = await setup();
+    const n = gh.addIssue({ title: "moving target", labeledBy: USERS.xbankov });
+    let edited = false;
+    oc.answer = (prompt) => {
+      if (!edited) {
+        edited = true;
+        gh.edit(n, { body: "new details" });
+      }
+      return JSON.stringify(defaultProposal(/#\d+: (.*)/.exec(prompt)?.[1] ?? "x"));
+    };
+    await cycle();
+    expect(task(n)?.status).toBe("ANALYZING");
+    expect(gh.botComments(n)).toEqual([]);
+    app.db
+      .update(jobs)
+      .set({ availableAt: new Date(0) })
+      .where(eq(jobs.status, "pending"))
+      .run();
+    await drain();
+    expect(task(n)).toMatchObject({ status: "AWAITING_APPROVAL", proposalVersion: 1 });
+    expect(gh.botComments(n)).toHaveLength(1);
+  });
+
+  it("does not publish when the allowed label was removed during analysis", async () => {
+    const { gh, oc, cycle, task } = await setup();
+    const n = gh.addIssue({ title: "withdrawn", labeledBy: USERS.xbankov });
+    oc.answer = (prompt) => {
+      gh.unlabel(n, "ai-allowed");
+      return JSON.stringify(defaultProposal(/#\d+: (.*)/.exec(prompt)?.[1] ?? "x"));
+    };
+    await cycle();
+    expect(gh.botComments(n)).toEqual([]);
+    await cycle();
+    expect(task(n)?.status).toBe("ABANDONED");
+  });
+
+  it("repairs a wrong status label", async () => {
+    const { gh, cycle } = await setup();
+    const n = gh.addIssue({ title: "mislabelled", labeledBy: USERS.xbankov });
+    await cycle();
+    gh.unlabel(n, "ai:waiting-for-review");
+    gh.label(n, "ai:running", USERS.stranger);
+    await cycle();
+    expect(gh.labelsOf(n)).toEqual(["ai-allowed", "ai:waiting-for-review"]);
+  });
+
+  it("clears the queued label of a deferred issue that is no longer allowed", async () => {
+    const { gh, cycle, task } = await setup({ batch: 1 });
+    gh.addIssue({ title: "busy", labeledBy: USERS.xbankov });
+    const deferred = gh.addIssue({ title: "deferred", labeledBy: USERS.xbankov });
+    await cycle();
+    expect(gh.labelsOf(deferred)).toEqual(["ai-allowed", "ai:queued"]);
+    gh.unlabel(deferred, "ai-allowed");
+    await cycle();
+    expect(task(deferred)).toBeUndefined();
+    expect(gh.labelsOf(deferred)).toEqual([]);
+  });
+
+  it("an unchanged re-analysis makes the proposal pending again", async () => {
+    const { app, gh, cycle, task } = await setup();
+    const n = gh.addIssue({ title: "same again", labeledBy: USERS.xbankov });
+    await cycle();
+    gh.comment(n, USERS.xbankov, "/ai reject");
+    await cycle();
+    expect(app.db.select().from(proposals).get()?.status).toBe("rejected");
+    gh.comment(n, USERS.xbankov, "/ai revise please reconsider");
+    await cycle(); // the fake model returns the same proposal
+    expect(task(n)).toMatchObject({ status: "AWAITING_APPROVAL", proposalVersion: 1 });
+    expect(
+      app.db
+        .select()
+        .from(proposals)
+        .all()
+        .map((p) => p.status),
+    ).toEqual(["pending"]);
+    expect(gh.botComments(n).at(-1)).toContain("same proposal");
   });
 });

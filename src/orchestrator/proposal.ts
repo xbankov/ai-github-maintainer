@@ -100,13 +100,18 @@ export const PROPOSAL_MARKER = /<!--\s*ai-maintainer:proposal task=(\d+) version
 /**
  * Makes model-written text safe to embed in a GitHub comment: no mentions
  * (no surprise notifications), no HTML comments (cannot fake our markers),
- * no raw HTML.
+ * no raw HTML, and no clickable links (an issue author could otherwise make
+ * the bot post a phishing link): Markdown link/image syntax is escaped and
+ * bare URLs are defanged.
  */
 export function sanitize(text: string): string {
   return text
     .replace(/<!--[\s\S]*?-->/g, "")
     .replace(/</g, "&lt;")
-    .replace(/(^|[^\w`])@(?=[A-Za-z0-9])/g, "$1@​")
+    .replace(/[[\]]/g, (c) => `\\${c}`)
+    .replace(/\b([a-z][a-z0-9+.-]*):\/\//gi, "$1[:]//")
+    .replace(/\bwww\./gi, "www[.]")
+    .replace(/(^|[^\w`])@(?=[A-Za-z0-9])/g, "$1@\u200b")
     .trim();
 }
 

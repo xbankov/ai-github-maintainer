@@ -117,10 +117,10 @@ export async function createApplication(
         jobTimeoutMs: (limits.analysis_timeout_minutes + 10) * 60_000,
         concurrency: limits.max_parallel_jobs,
         handlers: {
-          [SYNC_JOB]: async (job) => {
-            await syncRepository(orchestrator, job);
+          [SYNC_JOB]: async (job, signal) => {
+            await syncRepository(orchestrator, job, signal);
           },
-          [ANALYZE_JOB]: (job) => analyzeIssue(orchestrator, job),
+          [ANALYZE_JOB]: (job, signal) => analyzeIssue(orchestrator, job, signal),
         },
         onDead: async (job) => {
           if (job.type === ANALYZE_JOB) await onAnalysisDead(orchestrator, job);

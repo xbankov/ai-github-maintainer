@@ -7,15 +7,16 @@ import {
   findLabelActor,
   getIssue,
   listCommentsSince,
-  listOpenIssuesWithLabel,
+  listIssuesWithLabel,
   setStatusLabel,
+  STATUS_LABELS,
   type IssueSummary,
 } from "../github/issues.js";
 import { canTransition } from "../orchestrator/state-machine.js";
 import type { Job } from "../workers/queue.js";
 import { enqueue, hasActiveJob } from "../workers/queue.js";
 import { ANALYZE_JOB, analyzeDedupeKey } from "./analysis.js";
-import { handleCommandComment } from "./approvals.js";
+import { handleCommandComment, unfinishedCommands } from "./approvals.js";
 import type { OrchestratorContext, Task } from "./context.js";
 import { issueFingerprint } from "./proposal.js";
 
@@ -44,10 +45,15 @@ export interface SyncResult {
   started: number[];
   abandoned: number[];
   reanalysed: number[];
+  labelsCleared: number[];
 }
 
 /** One polling cycle for one repository. */
-export async function syncRepository(ctx: OrchestratorContext, job: Job): Promise<SyncResult> {
+export async function syncRepository(
+  ctx: OrchestratorContext,
+  job: Job,
+  signal?: AbortSignal,
+): Promise<SyncResult> {
   const repositoryId = (job.payload as { repositoryId: string }).repositoryId;
   const repo = ctx.repository(repositoryId);
   const ref = ctx.ref(repo);
@@ -59,6 +65,7 @@ export async function syncRepository(ctx: OrchestratorContext, job: Job): Promis
     started: [],
     abandoned: [],
     reanalysed: [],
+    labelsCleared: [],
   };
   const allowedLabel = ctx.config.file.github.allowed_label;
 
@@ -73,7 +80,10 @@ export async function syncRepository(ctx: OrchestratorContext, job: Job): Promis
     ctx.labelsEnsured.add(repo.id);
   }
 
-  // 1. Commands in comments since the last poll.
+  // 1. Commands: first resume any that did not finish, then new comments since the last poll.
+  for (const comment of unfinishedCommands(ctx, repo.id)) {
+    if (await handleCommandComment(ctx, repo.id, comment)) result.commands++;
+  }
   const cursorKey = `comments-cursor:${repo.id}`;
   const pollStarted = new Date();
   const cursorRow = ctx.db.select().from(settings).where(eq(settings.key, cursorKey)).get();
@@ -82,6 +92,7 @@ export async function syncRepository(ctx: OrchestratorContext, job: Job): Promis
     : new Date(pollStarted.getTime() - FIRST_POLL_LOOKBACK_MS);
   const identity = await ctx.identity();
   for (const comment of await listCommentsSince(octokit, ref, since)) {
+    signal?.throwIfAborted();
     if (comment.user?.type === "Bot" || comment.user?.login === identity.botLogin) continue;
     if (await handleCommandComment(ctx, repo.id, comment)) result.commands++;
   }
@@ -95,9 +106,9 @@ export async function syncRepository(ctx: OrchestratorContext, job: Job): Promis
     .run();
 
   // 2. Issues a maintainer has allowed.
-  const maintainers = await ctx.maintainers();
+  const maintainers = await ctx.maintainers(ref);
   const eligible = new Map<number, IssueSummary>();
-  for (const issue of await listOpenIssuesWithLabel(octokit, ref, allowedLabel)) {
+  for (const issue of await listIssuesWithLabel(octokit, ref, allowedLabel)) {
     if (issue.author?.login === identity.botLogin) continue; // own feature proposals are never auto-processed
     const cacheKey = `${repo.id}#${issue.number}`;
     let cached = ctx.labelActorCache.get(cacheKey);
@@ -112,10 +123,12 @@ export async function syncRepository(ctx: OrchestratorContext, job: Job): Promis
         );
       }
     }
-    if (cached.actorId !== null && maintainers.has(cached.actorId))
+    if (cached.actorId !== null && maintainers.has(cached.actorId)) {
       eligible.set(issue.number, issue);
+    }
   }
   result.eligible = eligible.size;
+  signal?.throwIfAborted();
 
   // 3. Reconcile existing tasks with the current issue state.
   const live = ctx.db
@@ -126,14 +139,13 @@ export async function syncRepository(ctx: OrchestratorContext, job: Job): Promis
   for (const task of live) {
     const issue = eligible.get(task.githubIssueNumber);
     if (!issue) {
-      await stopTask(ctx, task, allowedLabel);
-      result.abandoned.push(task.githubIssueNumber);
+      if (await stopTask(ctx, task, allowedLabel)) result.abandoned.push(task.githubIssueNumber);
       continue;
     }
     const changed =
       task.issueFingerprint !== null && task.issueFingerprint !== issueFingerprint(issue);
     if (changed && canTransition(task.status, "ANALYZING", "issue_changed")) {
-      transitionTask(ctx.db, {
+      const analysing = transitionTask(ctx.db, {
         taskId: task.id,
         to: "ANALYZING",
         trigger: "issue_changed",
@@ -146,17 +158,23 @@ export async function syncRepository(ctx: OrchestratorContext, job: Job): Promis
         issue.number,
         "🤖 The issue changed, so it will be analysed again. Any approval of the previous proposal no longer applies.",
       );
+      await ctx.syncStatusLabel(analysing, issue.labels);
       result.reanalysed.push(issue.number);
       continue;
     }
-    // Recovery: work that should be in progress but has no job (e.g. after a crash).
+    // Recovery: work that should be in progress but has no job (e.g. after a crash),
+    // including a stored proposal whose publication was interrupted.
     const unpublished =
-      task.status === "AWAITING_APPROVAL" && !ctx.latestProposal(task.id)?.githubCommentId;
+      task.status === "AWAITING_APPROVAL" && !ctx.latestProposal(task.id)?.publishedAt;
     if (
       (task.status === "DISCOVERED" || task.status === "ANALYZING" || unpublished) &&
       !hasActiveJob(ctx.db, analyzeDedupeKey(task.id))
     ) {
       enqueueAnalysis(ctx, task);
+    }
+    // Display: make the status label match the task (repairs interrupted label updates).
+    if (!hasActiveJob(ctx.db, analyzeDedupeKey(task.id))) {
+      await ctx.syncStatusLabel(task, issue.labels);
     }
   }
 
@@ -201,21 +219,43 @@ export async function syncRepository(ctx: OrchestratorContext, job: Job): Promis
     slots--;
   }
 
+  // 5. Remove status labels from issues the maintainer no longer works on
+  //    (e.g. deferred issues that lost the allowed label or were closed).
+  const tracked = new Set(
+    ctx.db
+      .select({ n: tasks.githubIssueNumber })
+      .from(tasks)
+      .where(and(eq(tasks.repositoryId, repo.id), inArray(tasks.status, [...PRE_PR_STATES])))
+      .all()
+      .map((t) => t.n),
+  );
+  const seen = new Set<number>();
+  for (const status of Object.values(STATUS_LABELS)) {
+    for (const issue of await listIssuesWithLabel(octokit, ref, status.name, "all")) {
+      if (seen.has(issue.number)) continue;
+      seen.add(issue.number);
+      const wanted =
+        issue.state === "open" && (tracked.has(issue.number) || eligible.has(issue.number));
+      if (!wanted) {
+        await setStatusLabel(octokit, ref, issue.number, issue.labels, null);
+        result.labelsCleared.push(issue.number);
+      }
+    }
+  }
+
   ctx.db
     .update(repositories)
     .set({ lastDiscoveryAt: new Date() })
     .where(eq(repositories.id, repo.id))
     .run();
-  if (
+  const busy =
     result.commands ||
     result.started.length ||
     result.abandoned.length ||
-    result.reanalysed.length
-  ) {
-    log.info(result, "sync complete");
-  } else {
-    log.debug(result, "sync complete");
-  }
+    result.reanalysed.length ||
+    result.labelsCleared.length;
+  if (busy) log.info(result, "sync complete");
+  else log.debug(result, "sync complete");
   return result;
 }
 
@@ -230,12 +270,16 @@ function enqueueAnalysis(ctx: OrchestratorContext, task: Task) {
 }
 
 /** The issue was closed or lost its allowed label: stop working on it. */
-async function stopTask(ctx: OrchestratorContext, task: Task, allowedLabel: string) {
+async function stopTask(
+  ctx: OrchestratorContext,
+  task: Task,
+  allowedLabel: string,
+): Promise<boolean> {
   const ref = ctx.ref(ctx.repository(task.repositoryId));
   const octokit = await ctx.github.octokitFor(ref);
   const issue = await getIssue(octokit, ref, task.githubIssueNumber);
   const trigger = issue.state === "closed" ? "issue_closed" : "manual_abandon";
-  if (!canTransition(task.status, "ABANDONED", trigger)) return;
+  if (!canTransition(task.status, "ABANDONED", trigger)) return false;
   transitionTask(ctx.db, {
     taskId: task.id,
     to: "ABANDONED",
@@ -253,4 +297,5 @@ async function stopTask(ctx: OrchestratorContext, task: Task, allowedLabel: stri
       `🤖 Stopped: the \`${allowedLabel}\` label was removed (or not added by a maintainer). Add it again to restart.`,
     );
   }
+  return true;
 }

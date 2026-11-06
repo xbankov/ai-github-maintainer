@@ -16,7 +16,7 @@ export const STATUS_LABELS = {
   },
 } as const;
 export type StatusLabel = keyof typeof STATUS_LABELS;
-const STATUS_LABEL_NAMES: string[] = Object.values(STATUS_LABELS).map((l) => l.name);
+export const STATUS_LABEL_NAMES: string[] = Object.values(STATUS_LABELS).map((l) => l.name);
 
 export interface IssueSummary {
   number: number;
@@ -85,15 +85,16 @@ function toComment(raw: RawComment): IssueComment {
   };
 }
 
-/** Open issues (not pull requests) carrying `label`, oldest first. */
-export async function listOpenIssuesWithLabel(
+/** Issues (not pull requests) carrying `label`, oldest first. */
+export async function listIssuesWithLabel(
   octokit: Octokit,
   repo: RepoRef,
   label: string,
+  state: "open" | "all" = "open",
 ): Promise<IssueSummary[]> {
   const raw = (await octokit.paginate("GET /repos/{owner}/{repo}/issues", {
     ...params(repo),
-    state: "open",
+    state,
     labels: label,
     sort: "created",
     direction: "asc",
@@ -167,21 +168,18 @@ export async function listCommentsSince(
   return raw.map(toComment);
 }
 
+/** Posts a comment; returns its id and GitHub's creation time. */
 export async function createComment(
   octokit: Octokit,
   repo: RepoRef,
   number: number,
   body: string,
-): Promise<number> {
+): Promise<{ id: number; createdAt: string }> {
   const { data } = await octokit.request(
     "POST /repos/{owner}/{repo}/issues/{issue_number}/comments",
-    {
-      ...params(repo),
-      issue_number: number,
-      body,
-    },
+    { ...params(repo), issue_number: number, body },
   );
-  return Number(data.id);
+  return { id: Number(data.id), createdAt: data.created_at };
 }
 
 /** Creates the status labels (and the allowed label) if they do not exist yet. */

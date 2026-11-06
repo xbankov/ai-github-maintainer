@@ -1,0 +1,1 @@
+ALTER TABLE `proposals` ADD `published_at` integer;

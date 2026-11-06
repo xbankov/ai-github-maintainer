@@ -8,6 +8,8 @@ import {
   renderProposalComment,
   sanitize,
 } from "../src/orchestrator/proposal.js";
+import { staleness } from "../src/orchestrator/approvals.js";
+import { buildAnalysisPrompt, PROMPT_LIMITS } from "../src/orchestrator/prompts.js";
 import { defaultProposal } from "./fake-opencode.js";
 
 describe("command parsing", () => {
@@ -91,5 +93,63 @@ describe("proposals", () => {
     });
     expect(body.match(/ai-maintainer:proposal/g)).toHaveLength(1);
     expect(body).toContain("task=7 version=2");
+  });
+});
+
+describe("review fixes (units)", () => {
+  const proposalRow = (publishedAt: Date | null) =>
+    ({ version: 2, publishedAt }) as Parameters<typeof staleness>[1];
+
+  it("staleness uses the publication time with second precision", () => {
+    const published = new Date("2026-01-01T10:00:00Z");
+    expect(staleness({ createdAt: "2026-01-01T10:00:00Z" }, proposalRow(published))).toMatch(
+      /changed/,
+    );
+    expect(staleness({ createdAt: "2026-01-01T09:59:59Z" }, proposalRow(published))).toMatch(
+      /changed/,
+    );
+    expect(staleness({ createdAt: "2026-01-01T10:00:01Z" }, proposalRow(published))).toBeNull();
+    expect(staleness({ createdAt: "2026-01-01T10:00:01Z" }, proposalRow(null))).toMatch(
+      /being published/,
+    );
+    expect(staleness({ createdAt: "2026-01-01T10:00:01Z" }, undefined)).toBeNull();
+  });
+
+  it("model text cannot produce clickable links", () => {
+    const out = sanitize("see [docs](https://evil.example/x) ![i](http://a.b/c.png) www.evil.com");
+    expect(out).not.toMatch(/(?<!\\)\]\(/); // only escaped "\](" remains: rendered as text
+    expect(out).not.toMatch(/https?:\/\//);
+    expect(out).not.toMatch(/www\./);
+    expect(out).toContain("evil.example");
+  });
+
+  it("bounds the size of the analysis prompt", () => {
+    const comments = Array.from({ length: 200 }, (_, i) => ({
+      id: i,
+      issueNumber: 1,
+      body: "x".repeat(10_000),
+      user: { login: `u${i}`, id: i, type: "User" },
+      createdAt: `2026-01-01T00:${String(i % 60).padStart(2, "0")}:00Z`,
+      updatedAt: "",
+    }));
+    const prompt = buildAnalysisPrompt({
+      repository: "o/r",
+      instructions: "",
+      issue: {
+        number: 1,
+        title: "t",
+        body: "b".repeat(100_000),
+        state: "open",
+        labels: [],
+        author: null,
+        createdAt: "",
+        updatedAt: "",
+      },
+      comments,
+    });
+    expect(prompt.length).toBeLessThan(PROMPT_LIMITS.issueBody + PROMPT_LIMITS.comments + 10_000);
+    expect(prompt).toContain("older comment(s) omitted");
+    expect(prompt).toContain("u199"); // the most recent comment is kept
+    expect(prompt).toContain("truncated");
   });
 });

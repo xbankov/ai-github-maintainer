@@ -16,6 +16,7 @@ async function main(): Promise<void> {
   }
 
   const logger = createLogger(config.env.LOG_LEVEL);
+  for (const warning of config.warnings) logger.warn(warning);
   logger.info(
     {
       repositories: config.file.repositories.map(

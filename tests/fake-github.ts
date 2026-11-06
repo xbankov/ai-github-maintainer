@@ -51,6 +51,8 @@ export class FakeGitHub {
   issues = new Map<number, FakeIssue>();
   comments: FakeComment[] = [];
   repoLabels = new Set<string>();
+  /** Number of upcoming comment posts that fail with HTTP 500 (failure injection). */
+  failCommentPosts = 0;
   private nextNumber = 1;
   private nextCommentId = 1000;
   private clock = Date.parse("2026-01-01T00:00:00Z");
@@ -203,7 +205,9 @@ export class FakeGitHub {
     if (method === "GET" && sub === "/issues") {
       const label = q.get("labels");
       const list = [...this.issues.values()]
-        .filter((i) => i.state === (q.get("state") ?? "open"))
+        .filter(
+          (i) => (q.get("state") ?? "open") === "all" || i.state === (q.get("state") ?? "open"),
+        )
         .filter((i) => !label || i.labels.includes(label))
         .sort((a, b) => a.created_at.localeCompare(b.created_at));
       return { body: list.map((i) => this.issueJson(i)) };
@@ -225,8 +229,13 @@ export class FakeGitHub {
         return { body: this.commentsOn(issue.number).map((c) => this.commentJson(c)) };
       }
       if (method === "POST" && rest === "/comments") {
+        if (this.failCommentPosts > 0) {
+          this.failCommentPosts--;
+          return { status: 500, body: { message: "Server Error" } };
+        }
         const id = this.comment(issue.number, USERS.bot, (body as { body: string }).body);
-        return { status: 201, body: { id } };
+        const created = this.comments.find((c) => c.id === id)!;
+        return { status: 201, body: { id, created_at: created.created_at } };
       }
       if (method === "POST" && rest === "/labels") {
         for (const name of (body as { labels: string[] }).labels)

@@ -85,6 +85,23 @@ describe("repository configuration", () => {
     });
   });
 
+  it("rejects an allowed label that is a bot status label", () => {
+    expect(() =>
+      parseFileConfig({
+        ...baseFileConfig,
+        github: { authorized_users: ["xbankov"], allowed_label: "AI:Queued" },
+      }),
+    ).toThrow(/status labels/);
+  });
+
+  it("accepts the deprecated trusted_issue_authors key with a warning", () => {
+    const cfg = testConfig({
+      file: { github: { authorized_users: ["xbankov"], trusted_issue_authors: ["xbankov"] } },
+    });
+    expect(cfg.warnings).toEqual([expect.stringContaining("deprecated")]);
+    expect(testConfig().warnings).toEqual([]);
+  });
+
   it("defaults the allowed label and polling interval", () => {
     const d = testConfig().file;
     expect(d.github.allowed_label).toBe("ai-allowed");

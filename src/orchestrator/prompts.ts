@@ -27,6 +27,32 @@ function neutralise(text: string): string {
   return text.replace(/<\/?\s*untrusted[^>]*>/gi, "[removed tag]");
 }
 
+/** Size limits keep long discussions within the model's context. */
+export const PROMPT_LIMITS = { issueBody: 20_000, comment: 4_000, comments: 24_000 };
+
+function clip(text: string, max: number): string {
+  return text.length <= max
+    ? text
+    : `${text.slice(0, max)}\n[… truncated ${text.length - max} characters]`;
+}
+
+/** Most recent comments first in priority, each clipped, within the total budget; shown oldest first. */
+function boundedComments(comments: IssueComment[]): string {
+  const picked: string[] = [];
+  let used = 0;
+  for (const c of [...comments].reverse()) {
+    const entry = `--- ${c.user?.login ?? "unknown"} (${c.createdAt}):\n${clip(c.body, PROMPT_LIMITS.comment)}`;
+    if (used + entry.length > PROMPT_LIMITS.comments) break;
+    picked.unshift(entry);
+    used += entry.length;
+  }
+  const omitted = comments.length - picked.length;
+  return [
+    ...(omitted > 0 ? [`[${omitted} older comment(s) omitted for length]`] : []),
+    ...picked,
+  ].join("\n\n");
+}
+
 export function buildAnalysisPrompt(input: {
   repository: string;
   instructions: string;
@@ -40,13 +66,9 @@ export function buildAnalysisPrompt(input: {
     `Opened by ${input.issue.author?.login ?? "unknown"} on ${input.issue.createdAt}`,
     `Labels: ${input.issue.labels.join(", ") || "none"}`,
     "",
-    input.issue.body || "(no description)",
+    clip(input.issue.body || "(no description)", PROMPT_LIMITS.issueBody),
   ].join("\n");
-  const comments = input.comments.length
-    ? input.comments
-        .map((c) => `--- ${c.user?.login ?? "unknown"} (${c.createdAt}):\n${c.body}`)
-        .join("\n\n")
-    : "(no comments)";
+  const comments = input.comments.length ? boundedComments(input.comments) : "(no comments)";
   const revision = input.revision
     ? [
         "",

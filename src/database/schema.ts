@@ -91,6 +91,8 @@ export const proposals = sqliteTable(
     fingerprint: text("fingerprint").notNull(),
     status: text("status", { enum: PROPOSAL_STATUSES }).notNull().default("pending"),
     githubCommentId: integer("github_comment_id"),
+    /** When the proposal comment appeared on GitHub (GitHub's clock). */
+    publishedAt: integer("published_at", { mode: "timestamp_ms" }),
     createdAt: createdAt(),
   },
   (t) => [

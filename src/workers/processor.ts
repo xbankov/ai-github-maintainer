@@ -10,7 +10,13 @@ export class PermanentJobError extends Error {
   override name = "PermanentJobError";
 }
 
-export type JobHandler = (job: Job) => Promise<void>;
+/**
+ * A job handler. `signal` is aborted when the job exceeds its time limit; the
+ * handler must stop its work (e.g. interrupt the agent) and settle. The job is
+ * released for retry only after the handler has settled, so a timed-out run
+ * never overlaps with its retry.
+ */
+export type JobHandler = (job: Job, signal: AbortSignal) => Promise<void>;
 
 export interface ProcessorOptions {
   db: Db;
@@ -80,17 +86,14 @@ export class JobProcessor {
     }
     log.info("job started");
     const started = Date.now();
-    let timeout: NodeJS.Timeout | undefined;
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(new Error(`job timed out after ${this.options.jobTimeoutMs} ms`)),
+      this.options.jobTimeoutMs,
+    );
     try {
-      await Promise.race([
-        handler(job),
-        new Promise<never>((_, reject) => {
-          timeout = setTimeout(
-            () => reject(new Error(`job timed out after ${this.options.jobTimeoutMs} ms`)),
-            this.options.jobTimeoutMs,
-          );
-        }),
-      ]);
+      await handler(job, controller.signal);
+      if (controller.signal.aborted) throw controller.signal.reason;
       completeJob(this.options.db, job.id);
       log.info({ ms: Date.now() - started }, "job succeeded");
     } catch (err) {

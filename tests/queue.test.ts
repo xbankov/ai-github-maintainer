@@ -59,24 +59,22 @@ describe("job queue", () => {
     expect(claimNext(d, "w3")?.repositoryId).toBe("songbook");
   });
 
-  it("retries with exponential backoff, then marks the job dead", () => {
+  it("retries with exponential backoff (persisted), then marks the job dead", () => {
     const d = db();
     enqueue(d, { type: "t", payload: {}, maxAttempts: 3 });
-    const now = new Date("2026-01-01T00:00:00Z");
-    let job = claimNext(d, "w", later(0))!;
-    expect(failJob(d, job, "boom", { now })).toEqual({
-      dead: false,
-      retryAt: new Date(now.getTime() + 30_000),
-    });
-    d.update(jobs)
-      .set({ availableAt: new Date(0) })
-      .run();
-    job = claimNext(d, "w")!;
-    expect(failJob(d, job, "boom", { now }).retryAt).toEqual(new Date(now.getTime() + 60_000));
-    d.update(jobs)
-      .set({ availableAt: new Date(0) })
-      .run();
-    job = claimNext(d, "w")!;
+    const now = new Date();
+    let job = claimNext(d, "w", now)!;
+    const first = failJob(d, job, "boom", { now });
+    expect(first).toEqual({ dead: false, retryAt: new Date(now.getTime() + 30_000) });
+    // The delay is stored and enforced, not just reported.
+    expect(d.select().from(jobs).get()?.availableAt).toEqual(first.retryAt);
+    expect(claimNext(d, "w", new Date(now.getTime() + 29_000))).toBeUndefined();
+    job = claimNext(d, "w", new Date(now.getTime() + 30_000))!;
+    expect(job.attempts).toBe(2);
+    const second = failJob(d, job, "boom", { now });
+    expect(second.retryAt).toEqual(new Date(now.getTime() + 60_000));
+    expect(claimNext(d, "w", new Date(now.getTime() + 59_000))).toBeUndefined();
+    job = claimNext(d, "w", new Date(now.getTime() + 60_000))!;
     expect(failJob(d, job, "final", { now })).toEqual({ dead: true, retryAt: undefined });
     expect(d.select().from(jobs).get()).toMatchObject({
       status: "dead",

@@ -4,6 +4,7 @@ import type { RepositoryConfig } from "../config/schema.js";
 import type { Db } from "../database/client.js";
 import { auditLog, proposals, tasks } from "../database/schema.js";
 import type { AppIdentity, GitHubApp } from "../github/app.js";
+import { getIssue, setStatusLabel, type StatusLabel } from "../github/issues.js";
 import type { Logger } from "../logger.js";
 import type { OpenCode } from "../opencode/client.js";
 import type { WorkspaceManager, WorkspaceRepo } from "../workspace/manager.js";
@@ -51,14 +52,16 @@ export class OrchestratorContext {
     return this.identityCache.value;
   }
 
-  /** Maintainers by immutable GitHub user id → login (cached for an hour). */
-  async maintainers(): Promise<Map<number, string>> {
+  /**
+   * Maintainers by immutable GitHub user id → login (cached for an hour).
+   * Resolved through the installation of `via` — the repository being worked on —
+   * so a repository without the App installed cannot block the others.
+   */
+  async maintainers(via: { owner: string; name: string }): Promise<Map<number, string>> {
     if (!this.maintainerCache || Date.now() - this.maintainerCache.at > 3_600_000) {
-      const via =
-        this.config.file.repositories.find((r) => r.enabled) ?? this.config.file.repositories[0]!;
       const byLogin = await this.github.resolveUserIds(
         this.config.file.github.authorized_users,
-        this.ref(via),
+        via,
       );
       const ids = new Map<number, string>();
       for (const [login, id] of byLogin) ids.set(id, login);
@@ -94,6 +97,29 @@ export class OrchestratorContext {
       .orderBy(desc(proposals.version))
       .limit(1)
       .get();
+  }
+
+  /** The status label a task should show on GitHub (display only). */
+  statusLabelFor(task: Task): StatusLabel | null {
+    switch (task.status) {
+      case "DISCOVERED":
+      case "APPROVED":
+        return "queued";
+      case "ANALYZING":
+        return "running";
+      case "AWAITING_APPROVAL":
+        return this.latestProposal(task.id)?.publishedAt ? "waiting" : "running";
+      default:
+        return null;
+    }
+  }
+
+  /** Makes the issue's status label match the task's current state. */
+  async syncStatusLabel(task: Task, currentLabels?: string[]): Promise<void> {
+    const ref = this.ref(this.repository(task.repositoryId));
+    const octokit = await this.github.octokitFor(ref);
+    const labels = currentLabels ?? (await getIssue(octokit, ref, task.githubIssueNumber)).labels;
+    await setStatusLabel(octokit, ref, task.githubIssueNumber, labels, this.statusLabelFor(task));
   }
 
   audit(entry: {

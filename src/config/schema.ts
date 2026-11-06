@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { STATUS_LABEL_NAMES } from "../github/issues.js";
 
 /**
  * Repository configuration (config/repositories.yaml).
@@ -61,7 +62,16 @@ export const configSchema = z
          * An issue is processed only after a maintainer adds this label.
          * Labels added by anyone else are ignored.
          */
-        allowed_label: z.string().min(1).default("ai-allowed"),
+        allowed_label: z
+          .string()
+          .min(1)
+          .default("ai-allowed")
+          .refine(
+            (l) => !STATUS_LABEL_NAMES.some((s) => s.toLowerCase() === l.toLowerCase()),
+            "must not be one of the bot-managed status labels",
+          ),
+        /** Deprecated (replaced by allowed_label); accepted and ignored with a warning. */
+        trusted_issue_authors: z.array(ghName).optional(),
         proposal_label: z.string().min(1).default("ai-proposal"),
         api_url: z.url().default("https://api.github.com"),
       })

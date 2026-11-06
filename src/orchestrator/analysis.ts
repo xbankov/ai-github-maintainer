@@ -1,8 +1,14 @@
-import { and, eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { opencodeSettingsFor } from "../config/load.js";
-import { proposals, tasks } from "../database/schema.js";
+import { decisions, proposals } from "../database/schema.js";
 import { transitionTask } from "../database/tasks.js";
-import { createComment, getIssue, listIssueComments, setStatusLabel } from "../github/issues.js";
+import {
+  createComment,
+  findLabelActor,
+  getIssue,
+  listIssueComments,
+  setStatusLabel,
+} from "../github/issues.js";
 import type { Job } from "../workers/queue.js";
 import { PermanentJobError } from "../workers/processor.js";
 import type { OrchestratorContext, Task } from "./context.js";
@@ -20,20 +26,31 @@ export const ANALYZE_JOB = "analyze-issue";
 
 export interface AnalyzePayload {
   taskId: number;
-  /** Set for /ai revise. */
-  revision?: { instructions: string; by: string };
 }
 
 export const analyzeDedupeKey = (taskId: number) => `analyze:${taskId}`;
 
 const JSON_ATTEMPTS = 3;
 
+/** Retryable: the issue changed while the agent was working; analyse the new text. */
+export class IssueChangedError extends Error {
+  override name = "IssueChangedError";
+}
+
 /**
  * Analyses one issue with the read-only OpenCode agent and publishes a new
- * proposal version. Safe to retry: database state is written before the
- * comment is posted, and an already-posted comment is found by its marker.
+ * proposal version.
+ *
+ * Safe to retry at any point: the proposal row and the task transition are
+ * committed in one transaction; publishing is idempotent (an already-posted
+ * comment is found by its marker); labels are reconciled from the task state.
+ * The abort signal (job timeout) interrupts the agent.
  */
-export async function analyzeIssue(ctx: OrchestratorContext, job: Job): Promise<void> {
+export async function analyzeIssue(
+  ctx: OrchestratorContext,
+  job: Job,
+  signal: AbortSignal,
+): Promise<void> {
   const payload = job.payload as AnalyzePayload;
   let task = ctx.task(payload.taskId);
   if (!task) throw new PermanentJobError(`task ${payload.taskId} not found`);
@@ -46,11 +63,13 @@ export async function analyzeIssue(ctx: OrchestratorContext, job: Job): Promise<
   });
   const octokit = await ctx.github.octokitFor(ref);
 
-  // A proposal was stored but publishing it was interrupted: only publish.
+  // The proposal is stored; publishing (or labelling) was interrupted: finish that only.
   if (task.status === "AWAITING_APPROVAL") {
     const latest = ctx.latestProposal(task.id);
-    if (latest && !latest.githubCommentId)
+    if (latest && !latest.publishedAt) {
       await publish(ctx, task, latest.version, latest.content as Proposal);
+    }
+    await ctx.syncStatusLabel(task);
     return;
   }
   if (task.status !== "DISCOVERED" && task.status !== "ANALYZING") {
@@ -73,6 +92,7 @@ export async function analyzeIssue(ctx: OrchestratorContext, job: Job): Promise<
   );
   const fingerprint = issueFingerprint(issue);
   const previous = ctx.latestProposal(task.id);
+  const revision = pendingRevision(ctx, task);
 
   // Read-only snapshot of the latest default branch for the agent to inspect.
   const wsRepo = ctx.workspaceRepo(repo);
@@ -99,14 +119,16 @@ export async function analyzeIssue(ctx: OrchestratorContext, job: Job): Promise<
         instructions: repo.instructions,
         issue,
         comments,
-        revision: payload.revision
+        revision: revision
           ? {
-              ...payload.revision,
+              instructions: revision.instructions ?? "",
+              by: revision.githubUser,
               previous: previous ? (previous.content as Proposal) : undefined,
             }
           : undefined,
       }),
       timeoutMs,
+      signal,
     );
     let lastError: string | undefined;
     let parsed: Proposal | undefined;
@@ -115,6 +137,7 @@ export async function analyzeIssue(ctx: OrchestratorContext, job: Job): Promise<
         sessionId,
         buildProposalJsonPrompt(lastError),
         timeoutMs,
+        signal,
       );
       const result = parseProposal(reply);
       if (result.ok) parsed = result.proposal;
@@ -129,56 +152,103 @@ export async function analyzeIssue(ctx: OrchestratorContext, job: Job): Promise<
     if (sessionId) await ctx.opencode.deleteSession(sessionId).catch(() => undefined);
     await ctx.workspace.removeWorktree(wsRepo, { taskKey: snapshotKey }).catch(() => undefined);
   }
+  signal.throwIfAborted();
 
-  // The task may have been stopped (label removed, issue closed) while the agent worked.
+  // The task or the issue may have changed while the agent worked.
   const current = ctx.task(task.id);
   if (current?.status !== "ANALYZING") {
     log.info({ status: current?.status }, "task changed during analysis; result discarded");
     return;
   }
+  const now = await getIssue(octokit, ref, issue.number);
+  const allowedLabel = ctx.config.file.github.allowed_label;
+  if (now.state !== "open" || !now.labels.includes(allowedLabel)) {
+    // The next sync stops the task; do not publish anything for it.
+    log.info({ state: now.state }, "issue closed or no longer allowed; result discarded");
+    return;
+  }
+  const actor = await findLabelActor(octokit, ref, now.number, allowedLabel);
+  if (!actor || !(await ctx.maintainers(ref)).has(actor.id)) {
+    log.info("allowed label is no longer from a maintainer; result discarded");
+    return;
+  }
+  if (issueFingerprint(now) !== fingerprint) {
+    throw new IssueChangedError("the issue changed during analysis; analysing the new version");
+  }
 
-  // Persist first, publish second.
+  // Store the proposal and move the task in one transaction.
   const fp = proposalFingerprint(proposal);
   const unchanged = previous && previous.fingerprint === fp;
   const version = unchanged ? previous.version : current.proposalVersion + 1;
-  const taskId = current.id;
-  ctx.db.transaction((tx) => {
-    if (!unchanged) {
-      tx.update(proposals)
-        .set({ status: "superseded" })
-        .where(and(eq(proposals.taskId, taskId), eq(proposals.status, "pending")))
-        .run();
-      tx.insert(proposals)
-        .values({ taskId, version, content: proposal, fingerprint: fp, status: "pending" })
-        .run();
-    }
-    tx.update(tasks).set({ lastError: null }).where(eq(tasks.id, taskId)).run();
-  });
   task = transitionTask(ctx.db, {
-    taskId,
+    taskId: current.id,
     to: "AWAITING_APPROVAL",
     trigger: "analysis_completed",
-    patch: { proposalVersion: version, approvedVersion: null, issueFingerprint: fingerprint },
-    details: { version, unchanged: Boolean(unchanged), revision: Boolean(payload.revision) },
+    patch: {
+      proposalVersion: version,
+      approvedVersion: null,
+      issueFingerprint: fingerprint,
+      lastError: null,
+    },
+    details: { version, unchanged: Boolean(unchanged), revision: Boolean(revision) },
+    within: (tx) => {
+      if (unchanged) {
+        // Same content as before: it is pending a (new) decision again.
+        tx.update(proposals).set({ status: "pending" }).where(eq(proposals.id, previous.id)).run();
+        return;
+      }
+      tx.update(proposals)
+        .set({ status: "superseded" })
+        .where(and(eq(proposals.taskId, current.id), eq(proposals.status, "pending")))
+        .run();
+      tx.insert(proposals)
+        .values({
+          taskId: current.id,
+          version,
+          content: proposal,
+          fingerprint: fp,
+          status: "pending",
+        })
+        .run();
+    },
   });
   log.info({ version, unchanged: Boolean(unchanged) }, "analysis complete");
 
   if (unchanged) {
-    await createComment(
+    const notice = await createComment(
       octokit,
       ref,
       issue.number,
       `🤖 Re-analysis produced the same proposal (v${version}); it still applies. ` +
         "Any previous approval has been reset — reply `/ai approve` to approve it again.",
     );
-    const fresh = await getIssue(octokit, ref, issue.number);
-    await setStatusLabel(octokit, ref, issue.number, fresh.labels, "waiting");
-    return;
+    // Commands must refer to this re-confirmation, not to the original publication.
+    ctx.db
+      .update(proposals)
+      .set({ publishedAt: new Date(notice.createdAt) })
+      .where(eq(proposals.id, previous.id))
+      .run();
+  } else {
+    await publish(ctx, task, version, proposal);
   }
-  await publish(ctx, task, version, proposal);
+  await ctx.syncStatusLabel(task);
 }
 
-/** Posts (or finds an already-posted) proposal comment and records its id. */
+/** The latest /ai revise decision for the current proposal version, if any. */
+function pendingRevision(ctx: OrchestratorContext, task: Task) {
+  const latest = ctx.db
+    .select()
+    .from(decisions)
+    .where(eq(decisions.taskId, task.id))
+    .orderBy(desc(decisions.id))
+    .limit(1)
+    .get();
+  return latest?.decision === "revise" && latest.proposalVersion === task.proposalVersion
+    ? latest
+    : undefined;
+}
+
+/** Posts (or finds an already-posted) proposal comment and records when it became visible. */
 async function publish(ctx: OrchestratorContext, task: Task, version: number, proposal: Proposal) {
   const repo = ctx.repository(task.repositoryId);
   const ref = ctx.ref(repo);
@@ -193,8 +263,8 @@ async function publish(ctx: OrchestratorContext, task: Task, version: number, pr
       Number(m[2]) === version
     );
   });
-  const commentId =
-    existing?.id ??
+  const posted =
+    existing ??
     (await createComment(
       octokit,
       ref,
@@ -203,16 +273,14 @@ async function publish(ctx: OrchestratorContext, task: Task, version: number, pr
     ));
   ctx.db
     .update(proposals)
-    .set({ githubCommentId: commentId })
+    .set({ githubCommentId: posted.id, publishedAt: new Date(posted.createdAt) })
     .where(and(eq(proposals.taskId, task.id), eq(proposals.version, version)))
     .run();
-  const issue = await getIssue(octokit, ref, task.githubIssueNumber);
-  await setStatusLabel(octokit, ref, issue.number, issue.labels, "waiting");
   ctx.audit({
     action: "proposal.published",
     repositoryId: task.repositoryId,
     taskId: task.id,
-    details: { version, commentId },
+    details: { version, commentId: posted.id },
   });
 }
 
@@ -221,7 +289,7 @@ export async function onAnalysisDead(ctx: OrchestratorContext, job: Job): Promis
   const payload = job.payload as AnalyzePayload;
   const task = ctx.task(payload.taskId);
   if (!task || task.status !== "ANALYZING") return;
-  transitionTask(ctx.db, {
+  const failed = transitionTask(ctx.db, {
     taskId: task.id,
     to: "FAILED",
     trigger: "analysis_failed",
@@ -229,12 +297,11 @@ export async function onAnalysisDead(ctx: OrchestratorContext, job: Job): Promis
   });
   const ref = ctx.ref(ctx.repository(task.repositoryId));
   const octokit = await ctx.github.octokitFor(ref);
-  const issue = await getIssue(octokit, ref, task.githubIssueNumber);
-  await setStatusLabel(octokit, ref, issue.number, issue.labels, null);
+  await ctx.syncStatusLabel(failed);
   await createComment(
     octokit,
     ref,
-    issue.number,
+    task.githubIssueNumber,
     `🤖 The analysis failed after ${job.attempts} attempts. A maintainer can retry with \`/ai revise <guidance>\`.`,
   );
 }

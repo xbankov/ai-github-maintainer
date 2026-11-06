@@ -6,6 +6,9 @@ import {
   type TransitionTrigger,
 } from "../orchestrator/state-machine.js";
 import type { Db } from "./client.js";
+
+/** A Drizzle transaction on the application database. */
+export type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 import { auditLog, tasks } from "./schema.js";
 
 export class TaskNotFoundError extends Error {
@@ -39,6 +42,11 @@ export interface TransitionInput {
   /** Extra columns updated atomically with the status. */
   patch?: TaskPatch;
   details?: Record<string, unknown>;
+  /**
+   * Extra writes committed atomically with the transition (e.g. the decision or
+   * proposal that justifies it). Runs after the status update succeeded.
+   */
+  within?: (tx: Tx, updated: typeof tasks.$inferSelect) => void;
 }
 
 /**
@@ -63,6 +71,7 @@ export function transitionTask(db: Db, input: TransitionInput): typeof tasks.$in
       .returning()
       .get();
     if (!updated) throw new StaleTaskError(`Task ${input.taskId} changed concurrently`);
+    input.within?.(tx, updated);
 
     tx.insert(auditLog)
       .values({
