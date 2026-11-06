@@ -2,44 +2,63 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 
 /** Structured analysis result (SPEC §2.2). Extra keys from the model are dropped. */
-export const proposalSchema = z
+const proposalFields = {
+  valid: z.boolean().describe("Does the issue make sense and is it actionable?"),
+  summary: z.string().min(1).max(600).describe("One or two sentences"),
+  reasoning: z
+    .string()
+    .min(1)
+    .max(5000)
+    .describe(
+      "Why the issue is (in)valid: actionable? already implemented? duplicate? consistent with the architecture? likely cause?",
+    ),
+  implementation: z
+    .array(z.string().min(1).max(1000))
+    .max(30)
+    .describe("Ordered implementation steps; empty if not actionable"),
+  affected_files: z.array(z.string().min(1).max(300)).max(60),
+  risks: z.array(z.string().min(1).max(1000)).max(20),
+  tests: z
+    .array(z.string().min(1).max(1000))
+    .max(20)
+    .default([])
+    .describe("Tests needed to verify the change"),
+  estimated_complexity: z.enum(["small", "medium", "large"]),
+  questions: z
+    .array(z.string().min(1).max(1000))
+    .max(20)
+    .describe("Missing information that must be clarified before implementing"),
+};
+
+const requirePlan = (
+  p: { valid: boolean; questions: string[]; implementation: string[] },
+  ctx: z.RefinementCtx,
+) => {
+  if (p.valid && p.questions.length === 0 && p.implementation.length === 0) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["implementation"],
+      message: "a valid issue without open questions needs implementation steps",
+    });
+  }
+};
+
+/** Structured analysis result (SPEC §2.2). Extra keys from the model are dropped. */
+export const proposalSchema = z.object(proposalFields).superRefine(requirePlan);
+export type Proposal = z.infer<typeof proposalSchema>;
+
+/** The plan the maintainer approved in the OpenCode session. */
+export const approvedPlanSchema = z
   .object({
-    valid: z.boolean().describe("Does the issue make sense and is it actionable?"),
-    summary: z.string().min(1).max(600).describe("One or two sentences"),
-    reasoning: z
-      .string()
-      .min(1)
-      .max(5000)
-      .describe(
-        "Why the issue is (in)valid: actionable? already implemented? duplicate? consistent with the architecture? likely cause?",
-      ),
-    implementation: z
-      .array(z.string().min(1).max(1000))
-      .max(30)
-      .describe("Ordered implementation steps; empty if not actionable"),
-    affected_files: z.array(z.string().min(1).max(300)).max(60),
-    risks: z.array(z.string().min(1).max(1000)).max(20),
-    tests: z
+    ...proposalFields,
+    differences_from_issue: z
       .array(z.string().min(1).max(1000))
       .max(20)
       .default([])
-      .describe("Tests needed to verify the change"),
-    estimated_complexity: z.enum(["small", "medium", "large"]),
-    questions: z
-      .array(z.string().min(1).max(1000))
-      .max(20)
-      .describe("Missing information that must be clarified before implementing"),
+      .describe("How the approved plan differs from the original issue description"),
   })
-  .superRefine((p, ctx) => {
-    if (p.valid && p.questions.length === 0 && p.implementation.length === 0) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["implementation"],
-        message: "a valid issue without open questions needs implementation steps",
-      });
-    }
-  });
-export type Proposal = z.infer<typeof proposalSchema>;
+  .superRefine(requirePlan);
+export type ApprovedPlan = z.infer<typeof approvedPlanSchema>;
 
 /**
  * A proposal can be approved when the issue is valid and there is a plan.
@@ -75,6 +94,15 @@ export function proposalFingerprint(p: Proposal): string {
 export function parseProposal(
   text: string,
 ): { ok: true; proposal: Proposal } | { ok: false; error: string } {
+  const r = parseStructured(text, proposalSchema);
+  return r.ok ? { ok: true, proposal: r.value } : r;
+}
+
+/** Extracts and validates one JSON object from a model reply. */
+export function parseStructured<T>(
+  text: string,
+  schema: z.ZodType<T>,
+): { ok: true; value: T } | { ok: false; error: string } {
   const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(text);
   const candidate = (fenced?.[1] ?? text).trim();
   const start = candidate.indexOf("{");
@@ -86,9 +114,9 @@ export function parseProposal(
   } catch (err) {
     return { ok: false, error: `invalid JSON: ${(err as Error).message}` };
   }
-  const result = proposalSchema.safeParse(raw);
+  const result = schema.safeParse(raw);
   return result.success
-    ? { ok: true, proposal: result.data }
+    ? { ok: true, value: result.data }
     : { ok: false, error: z.prettifyError(result.error) };
 }
 
@@ -161,4 +189,38 @@ export function renderProposalComment(input: {
       : "Maintainers: answer the questions in the issue (editing the issue triggers a new analysis) or reply `/ai revise <guidance>`; `/ai reject` declines.",
   );
   return parts.filter(Boolean).join("\n\n");
+}
+
+/** GitHub record of what the maintainer approved in OpenCode. */
+export function renderApprovedPlanComment(input: {
+  taskId: number;
+  version: number;
+  plan: ApprovedPlan;
+  approvedBy: string;
+}): string {
+  const p = input.plan;
+  const parts = [
+    `<!-- ai-maintainer:proposal task=${input.taskId} version=${input.version} -->`,
+    `### ✅ Approved implementation plan v${input.version}`,
+    `Approved by @${input.approvedBy} in the OpenCode session · **Complexity:** ${p.estimated_complexity}`,
+    `**Summary:** ${sanitize(p.summary)}`,
+    `#### Differences from the issue description\n${
+      p.differences_from_issue.length
+        ? list(p.differences_from_issue)
+        : "None — the plan follows the issue."
+    }`,
+    `#### Plan\n${list(p.implementation, true)}`,
+  ];
+  if (p.affected_files.length) {
+    parts.push(
+      `#### Affected files\n${p.affected_files.map((f) => `- \`${f.replace(/`/g, "")}\``).join("\n")}`,
+    );
+  }
+  if (p.tests.length) parts.push(`#### Tests\n${list(p.tests)}`);
+  if (p.risks.length) parts.push(`#### Risks\n${list(p.risks)}`);
+  parts.push(
+    "---",
+    "🤖 The bot now implements this plan and opens a pull request. It never merges.",
+  );
+  return parts.join("\n\n");
 }

@@ -200,6 +200,80 @@ export class OpenCode {
       )
     ).text;
   }
+
+  // --- Conversation sessions (the OpenCode UI is the maintainer's console) ---
+
+  /** Queues a message from the maintainer service (marked, so humans' messages can be told apart). */
+  async send(sessionId: string, text: string): Promise<void> {
+    await this.client.session.prompt(
+      { sessionID: sessionId, text, metadata: { source: SERVICE_SOURCE } },
+      this.timeout(),
+    );
+  }
+
+  /** Whether the agent loop of the session is running. */
+  async isBusy(sessionId: string): Promise<boolean> {
+    const active = await this.client.session.active(this.timeout());
+    return sessionId in active;
+  }
+
+  /** Open questions (forms) the agent asked and nobody answered yet. */
+  async pendingQuestions(sessionId: string): Promise<number> {
+    const forms = await this.client.session.form.list({ sessionID: sessionId }, this.timeout());
+    return (Array.isArray(forms) ? forms : (forms as { data: unknown[] }).data).length;
+  }
+
+  /** All messages of the session, oldest first. */
+  async messages(sessionId: string): Promise<SessionMessage[]> {
+    const messages = await this.client.session.context({ sessionID: sessionId }, this.timeout());
+    return messages.map((m) => {
+      const base = { id: m.id, created: m.time.created };
+      if (m.type === "user") {
+        const fromService =
+          (m.metadata as { source?: string } | undefined)?.source === SERVICE_SOURCE;
+        return { ...base, kind: fromService ? "service" : "human", text: m.text };
+      }
+      if (m.type === "assistant") {
+        const text = m.content.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("\n");
+        return { ...base, kind: "agent", text };
+      }
+      return { ...base, kind: "other", text: "" };
+    });
+  }
+
+  async interrupt(sessionId: string): Promise<void> {
+    await this.client.session.interrupt({ sessionID: sessionId }, this.timeout());
+  }
+
+  /** Switches the session to another agent and replaces its permission rules. */
+  async switchMode(sessionId: string, agent: string, permissions: PermissionRule[]): Promise<void> {
+    await this.client.session.update(
+      { sessionID: sessionId, permissions: [...BASE_SESSION_PERMISSIONS, ...permissions] },
+      this.timeout(),
+    );
+    await this.client.session.switchAgent({ sessionID: sessionId, agent }, this.timeout());
+  }
+}
+
+/** Marks messages sent by the maintainer service (vs. typed by a human in the UI). */
+export const SERVICE_SOURCE = "ai-maintainer";
+
+export interface SessionMessage {
+  id: string;
+  /** Milliseconds since epoch. */
+  created: number;
+  kind: "human" | "service" | "agent" | "other";
+  text: string;
+}
+
+/**
+ * Link to a session in the OpenCode web UI. The UI addresses servers by the
+ * base64url-encoded server address: /server/<base64url(url)>/session/<id>.
+ */
+export function sessionUrl(webUrl: string, sessionId: string): string {
+  const base = webUrl.replace(/\/$/, "");
+  const key = Buffer.from(base).toString("base64url");
+  return `${base}/server/${key}/session/${sessionId}`;
 }
 
 /** "provider/model" → OpenCode model reference. */

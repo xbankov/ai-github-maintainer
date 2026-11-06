@@ -11,7 +11,7 @@ These decisions override the corresponding parts of this specification.
    internet; the GitHub App's webhook stays inactive. The `events` table records
    processed command comments for idempotency instead of webhook deliveries.
 2. **Label gate** (§2.1). Only open issues to which a maintainer
-   (`github.authorized_users`) added the label `ai-allowed` are processed.
+   (`github.authorized_users`) added the label `ai:allowed` are processed.
    Labels added by anyone else are ignored. Removing the label or closing the
    issue stops work that has not reached a pull request.
 3. **One issue at a time** (§2.1, §13). `discovery.issue_batch_size` defaults
@@ -21,6 +21,16 @@ These decisions override the corresponding parts of this specification.
    of truth).
 5. **OpenCode client** (§3). OpenCode 2.x is used through the official
    `@opencode/client` package; `@opencode-ai/sdk` 1.x targets the OpenCode 1.x API.
+7. **OpenCode is the console** (§2.2, §2.3). Each issue gets one OpenCode
+   session (analysis, discussion and implementation). The agent may ask the
+   maintainer questions there. Implementation is approved by typing
+   `/ai approve` (or `/ai reject`) in the session; the bot then posts the
+   approved plan on the issue, including how it differs from the description.
+   `/ai` comments on GitHub are answered with the session link. After 30 minutes
+   of waiting for input, the maintainer is @mentioned on the issue.
+8. **Tests run in GitHub Actions** (§2.4). The bot opens a draft pull request,
+   waits for CI, sends failures back to the agent (bounded rounds), and marks the
+   PR ready for review when CI passes. AI-written code never runs on the server.
 6. **Approval with open questions** (§2.2). A valid proposal with an
    implementation plan may be approved even if it lists open questions;
    approving accepts the plan as written.

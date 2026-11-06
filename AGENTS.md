@@ -1,4 +1,4 @@
-# Working on this repository (instructions for Claude sessions)
+# Working on this repository (instructions for coding agents)
 
 Read SPEC.md (including its Amendments section) and README.md first.
 
@@ -17,7 +17,7 @@ Every change goes through a pull request opened by the bot
    - valid → fix it, add or adjust a test, `npm run check`, commit, push;
    - not valid → do not change the code.
    - Reply and resolve: `scripts/bot-pr.sh reply <thread-id> <body-file>`.
-7. After pushing fixes, repeat steps 5–6 for the new review (at most 3 rounds).
+7. Never ask Sourcery to re-review (no `@sourcery-ai review`). Handle only the reviews it posts on its own.
 8. Tell the user the PR is ready for their approval and merge.
 
 ## Thread reply style

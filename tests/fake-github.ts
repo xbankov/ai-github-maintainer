@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
 import { mockFetch } from "./helpers.js";
 
@@ -53,6 +54,52 @@ export class FakeGitHub {
   repoLabels = new Set<string>();
   /** Number of upcoming comment posts that fail with HTTP 500 (failure injection). */
   failCommentPosts = 0;
+  /** Local bare repository standing in for the GitHub remote (PR head commits come from it). */
+  originPath = "";
+  pulls = new Map<
+    number,
+    {
+      number: number;
+      head: string;
+      base: string;
+      title: string;
+      body: string;
+      draft: boolean;
+      state: "open" | "closed";
+    }
+  >();
+  /** CI result per head commit; default: one passing check. */
+  ci: (sha: string) => {
+    checks: Array<{ id: number; name: string; status: string; conclusion: string | null }>;
+    statuses: Array<{ context: string; state: string }>;
+  } = () => ({
+    checks: [{ id: 1, name: "test", status: "completed", conclusion: "success" }],
+    statuses: [],
+  });
+  jobLog = "line 1\nError: assertion failed in test_app.py\n";
+
+  headSha(branch: string): string {
+    return execFileSync("git", ["rev-parse", `refs/heads/${branch}`], {
+      cwd: this.originPath,
+      encoding: "utf8",
+    }).trim();
+  }
+
+  private pullJson(n: number) {
+    const p = this.pulls.get(n)!;
+    return {
+      number: p.number,
+      node_id: `PR_${p.number}`,
+      head: { ref: p.head, sha: this.headSha(p.head) },
+      base: { ref: p.base },
+      title: p.title,
+      body: p.body,
+      draft: p.draft,
+      state: p.state,
+      merged: false,
+      html_url: `https://github.test/xbankov/repo/pull/${p.number}`,
+    };
+  }
   private nextNumber = 1;
   private nextCommentId = 1000;
   private clock = Date.parse("2026-01-01T00:00:00Z");
@@ -87,7 +134,7 @@ export class FakeGitHub {
       ...(opts.pullRequest ? { pull_request: {} } : {}),
     };
     this.issues.set(number, issue);
-    if (opts.labeledBy) this.label(number, opts.label ?? "ai-allowed", opts.labeledBy);
+    if (opts.labeledBy) this.label(number, opts.label ?? "ai:allowed", opts.labeledBy);
     return number;
   }
 
@@ -209,11 +256,65 @@ export class FakeGitHub {
       return { status: 201, body: { token: "ghs_test", expires_at: "2099-01-01T00:00:00Z" } };
     }
     if (!isInstallation) return { status: 401, body: { message: "Bad credentials" } };
+    if (method === "POST" && path === "/graphql") {
+      const id = (body as { variables?: { id?: string } }).variables?.id ?? "";
+      const pr = this.pulls.get(Number(id.replace("PR_", "")));
+      if (pr) pr.draft = false;
+      return { body: { data: { markPullRequestReadyForReview: { clientMutationId: null } } } };
+    }
 
     const m = /^\/repos\/[^/]+\/[^/]+(\/.*)?$/.exec(path);
     if (!m) return undefined;
     const sub = m[1] ?? "";
 
+    if (method === "POST" && sub === "/pulls") {
+      const b = body as { head: string; base: string; title: string; body: string; draft: boolean };
+      const number = this.nextNumber++;
+      this.pulls.set(number, { number, ...b, draft: Boolean(b.draft), state: "open" });
+      const now = this.tick();
+      this.issues.set(number, {
+        number,
+        title: b.title,
+        body: b.body,
+        state: "open",
+        labels: [],
+        user: USERS.bot,
+        created_at: now,
+        updated_at: now,
+        events: [],
+        pull_request: {},
+      });
+      return { status: 201, body: this.pullJson(number) };
+    }
+    if (method === "GET" && sub === "/pulls") {
+      const head = q.get("head")?.split(":")[1];
+      return {
+        body: [...this.pulls.values()]
+          .filter((p) => p.state === (q.get("state") ?? "open") && (!head || p.head === head))
+          .map((p) => this.pullJson(p.number)),
+      };
+    }
+    const pull = /^\/pulls\/(\d+)$/.exec(sub);
+    if (pull && this.pulls.has(Number(pull[1]))) {
+      const p = this.pulls.get(Number(pull[1]))!;
+      if (method === "PATCH") Object.assign(p, body as object);
+      return { body: this.pullJson(p.number) };
+    }
+    const ci = /^\/commits\/([0-9a-f]+)\/(check-runs|status)$/.exec(sub);
+    if (method === "GET" && ci) {
+      const r = this.ci(ci[1]!);
+      return ci[2] === "check-runs"
+        ? {
+            body: {
+              total_count: r.checks.length,
+              check_runs: r.checks.map((c) => ({ ...c, app: { slug: "github-actions" } })),
+            },
+          }
+        : { body: { state: "success", statuses: r.statuses } };
+    }
+    if (method === "GET" && /^\/actions\/jobs\/\d+\/logs$/.test(sub)) {
+      return { body: this.jobLog, headers: { "content-type": "text/plain" } };
+    }
     if (method === "GET" && sub === "/labels")
       return { body: [...this.repoLabels].map((name) => ({ name })) };
     if (method === "POST" && sub === "/labels") {

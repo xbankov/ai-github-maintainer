@@ -8,7 +8,18 @@ import { HealthMonitor } from "./health.js";
 import { buildHttpServer } from "./http/server.js";
 import type { Logger } from "./logger.js";
 import { OpenCode } from "./opencode/client.js";
-import { ANALYZE_JOB, analyzeIssue, onAnalysisDead } from "./orchestrator/analysis.js";
+import {
+  CONVERSATION_JOB,
+  conversationStep,
+  onConversationDead,
+} from "./orchestrator/conversation.js";
+import {
+  awaitCi,
+  CI_JOB,
+  IMPLEMENT_JOB,
+  implementTask,
+  onImplementationDead,
+} from "./orchestrator/implementation.js";
 import { OrchestratorContext } from "./orchestrator/context.js";
 import { SYNC_JOB, syncRepository } from "./orchestrator/discovery.js";
 import { Scheduler } from "./orchestrator/scheduler.js";
@@ -116,14 +127,23 @@ export async function createApplication(
         envPaused: config.env.MAINTAINER_PAUSED,
         jobTimeoutMs: (limits.analysis_timeout_minutes + 10) * 60_000,
         concurrency: limits.max_parallel_jobs,
+        jobTimeouts: {
+          [IMPLEMENT_JOB]: (limits.task_timeout_minutes + 10) * 60_000,
+          [CI_JOB]: 5 * 60_000,
+        },
         handlers: {
           [SYNC_JOB]: async (job, signal) => {
             await syncRepository(orchestrator, job, signal);
           },
-          [ANALYZE_JOB]: (job, signal) => analyzeIssue(orchestrator, job, signal),
+          [CONVERSATION_JOB]: (job, signal) => conversationStep(orchestrator, job, signal),
+          [IMPLEMENT_JOB]: (job, signal) => implementTask(orchestrator, job, signal),
+          [CI_JOB]: (job) => awaitCi(orchestrator, job),
         },
         onDead: async (job) => {
-          if (job.type === ANALYZE_JOB) await onAnalysisDead(orchestrator, job);
+          if (job.type === CONVERSATION_JOB) await onConversationDead(orchestrator, job);
+          if (job.type === IMPLEMENT_JOB || job.type === CI_JOB) {
+            await onImplementationDead(orchestrator, job);
+          }
         },
       })
     : null;

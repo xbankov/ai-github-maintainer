@@ -22,6 +22,20 @@
       "when": 1793971566129,
       "tag": "0002_proposal_published_at",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1793973809100,
+      "tag": "0003_task_ci_attempts",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1793976268070,
+      "tag": "0004_session_conversation",
+      "breakpoints": true
     }
   ]
 }

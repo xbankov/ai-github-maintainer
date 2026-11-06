@@ -65,7 +65,7 @@ export const configSchema = z
         allowed_label: z
           .string()
           .min(1)
-          .default("ai-allowed")
+          .default("ai:allowed")
           .refine(
             (l) => !STATUS_LABEL_NAMES.some((s) => s.toLowerCase() === l.toLowerCase()),
             "must not be one of the bot-managed status labels",
@@ -103,6 +103,13 @@ export const configSchema = z
           .regex(/^[^/\s]+\/\S+$/, "must be provider/model, e.g. opencode-go/deepseek-v4.1-flash")
           .optional(),
         request_timeout_ms: z.number().int().min(1000).default(15_000),
+        /**
+         * Address of the OpenCode web UI as the maintainer opens it (LAN/VPN), used for
+         * session links on GitHub. Without it, comments name the session instead.
+         */
+        web_url: z.url().optional(),
+        /** GitHub login credited for decisions made in OpenCode (default: first authorized user). */
+        operator: ghName.optional(),
       })
       .strict(),
     limits: z
@@ -115,6 +122,12 @@ export const configSchema = z
         analysis_timeout_minutes: z.number().int().min(1).default(15),
         /** Jobs (analyses, syncs) running at the same time across all repositories. */
         max_parallel_jobs: z.number().int().min(1).max(4).default(1),
+        /** Longest wait for CI on the bot's pull request. */
+        ci_timeout_minutes: z.number().int().min(5).default(45),
+        /** If no CI check appears within this time, the repository is treated as having no CI. */
+        ci_grace_minutes: z.number().int().min(1).default(10),
+        /** The maintainer is notified on GitHub after the session waited this long for input. */
+        input_wait_minutes: z.number().int().min(1).default(30),
       })
       .strict()
       .default({
@@ -124,6 +137,9 @@ export const configSchema = z
         task_timeout_minutes: 60,
         analysis_timeout_minutes: 15,
         max_parallel_jobs: 1,
+        ci_timeout_minutes: 45,
+        ci_grace_minutes: 10,
+        input_wait_minutes: 30,
       }),
   })
   .strict()

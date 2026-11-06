@@ -43,7 +43,7 @@ github:
     - xbankov
     - VladoBaca
   # An issue is processed only after a maintainer adds this label.
-  allowed_label: ai-allowed
+  allowed_label: ai:allowed
   proposal_label: ai-proposal
 
 discovery:
@@ -62,6 +62,10 @@ opencode:
   implementation_agent: maintainer-build
   model: opencode-go/deepseek-v4.1-flash
   request_timeout_ms: 15000
+  # The OpenCode web UI as you open it (LAN/WireGuard); used for session links on GitHub.
+  web_url: http://192.168.178.50:4096
+  # GitHub login credited for approvals made in OpenCode.
+  operator: xbankov
 
 limits:
   max_review_iterations: 5
@@ -71,3 +75,8 @@ limits:
   analysis_timeout_minutes: 15
   # Jobs running at the same time across all repositories (1 = one issue at a time).
   max_parallel_jobs: 1
+  # CI runs in GitHub Actions on the bot's draft pull request.
+  ci_timeout_minutes: 45
+  ci_grace_minutes: 10
+  # Notify the maintainer on GitHub after the session waited this long for input.
+  input_wait_minutes: 30

@@ -8,8 +8,7 @@ import {
   renderProposalComment,
   sanitize,
 } from "../src/orchestrator/proposal.js";
-import { staleness } from "../src/orchestrator/approvals.js";
-import { buildAnalysisPrompt, PROMPT_LIMITS } from "../src/orchestrator/prompts.js";
+import { buildConversationPrompt, PROMPT_LIMITS } from "../src/orchestrator/prompts.js";
 import { defaultProposal } from "./fake-opencode.js";
 
 describe("command parsing", () => {
@@ -97,24 +96,6 @@ describe("proposals", () => {
 });
 
 describe("review fixes (units)", () => {
-  const proposalRow = (publishedAt: Date | null) =>
-    ({ version: 2, publishedAt }) as Parameters<typeof staleness>[1];
-
-  it("staleness uses the publication time with second precision", () => {
-    const published = new Date("2026-01-01T10:00:00Z");
-    expect(staleness({ createdAt: "2026-01-01T10:00:00Z" }, proposalRow(published))).toMatch(
-      /changed/,
-    );
-    expect(staleness({ createdAt: "2026-01-01T09:59:59Z" }, proposalRow(published))).toMatch(
-      /changed/,
-    );
-    expect(staleness({ createdAt: "2026-01-01T10:00:01Z" }, proposalRow(published))).toBeNull();
-    expect(staleness({ createdAt: "2026-01-01T10:00:01Z" }, proposalRow(null))).toMatch(
-      /being published/,
-    );
-    expect(staleness({ createdAt: "2026-01-01T10:00:01Z" }, undefined)).toBeNull();
-  });
-
   it("model text cannot produce clickable links", () => {
     const out = sanitize("see [docs](https://evil.example/x) ![i](http://a.b/c.png) www.evil.com");
     expect(out).not.toMatch(/(?<!\\)\]\(/); // only escaped "\](" remains: rendered as text
@@ -132,7 +113,7 @@ describe("review fixes (units)", () => {
       createdAt: `2026-01-01T00:${String(i % 60).padStart(2, "0")}:00Z`,
       updatedAt: "",
     }));
-    const prompt = buildAnalysisPrompt({
+    const prompt = buildConversationPrompt({
       repository: "o/r",
       instructions: "",
       issue: {

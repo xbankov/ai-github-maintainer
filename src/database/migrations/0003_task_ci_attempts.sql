@@ -1,0 +1,1 @@
+ALTER TABLE `tasks` ADD `ci_attempts` integer DEFAULT 0 NOT NULL;

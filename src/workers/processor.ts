@@ -3,11 +3,22 @@ import type { Db } from "../database/client.js";
 import { auditLog } from "../database/schema.js";
 import { getKillSwitch } from "../database/settings.js";
 import type { Logger } from "../logger.js";
-import { claimNext, completeJob, failJob, recoverStaleJobs, type Job } from "./queue.js";
+import { claimNext, completeJob, deferJob, failJob, recoverStaleJobs, type Job } from "./queue.js";
 
 /** Thrown by a handler for failures that retrying cannot fix. */
 export class PermanentJobError extends Error {
   override name = "PermanentJobError";
+}
+
+/** Thrown by a handler to be called again later; does not count as a failed attempt. */
+export class DeferJob extends Error {
+  override name = "DeferJob";
+  constructor(
+    readonly delayMs: number,
+    reason = "waiting",
+  ) {
+    super(reason);
+  }
 }
 
 /**
@@ -25,8 +36,10 @@ export interface ProcessorOptions {
   envPaused: boolean;
   /** Called when a job fails for the last time. */
   onDead?: (job: Job, error: string) => Promise<void>;
-  /** Hard limit for one job. */
+  /** Hard limit for one job (default for all types). */
   jobTimeoutMs: number;
+  /** Per job type overrides of the time limit. */
+  jobTimeouts?: Record<string, number>;
   pollIntervalMs?: number;
   /** Parallel workers (each runs one job at a time). Default 1. */
   concurrency?: number;
@@ -87,9 +100,10 @@ export class JobProcessor {
     log.info("job started");
     const started = Date.now();
     const controller = new AbortController();
+    const limitMs = this.options.jobTimeouts?.[job.type] ?? this.options.jobTimeoutMs;
     const timeout = setTimeout(
-      () => controller.abort(new Error(`job timed out after ${this.options.jobTimeoutMs} ms`)),
-      this.options.jobTimeoutMs,
+      () => controller.abort(new Error(`job timed out after ${limitMs} ms`)),
+      limitMs,
     );
     try {
       await handler(job, controller.signal);
@@ -97,6 +111,11 @@ export class JobProcessor {
       completeJob(this.options.db, job.id);
       log.info({ ms: Date.now() - started }, "job succeeded");
     } catch (err) {
+      if (err instanceof DeferJob && !controller.signal.aborted) {
+        const at = deferJob(this.options.db, job, err.delayMs);
+        log.debug({ until: at, reason: err.message }, "job deferred");
+        return true;
+      }
       const message = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
       const result = failJob(this.options.db, job, message, {
         permanent: err instanceof PermanentJobError,
