@@ -1,0 +1,207 @@
+# AI GitHub Maintainer
+
+A human-in-the-loop maintainer for GitHub repositories. It analyses issues with an
+AI coding agent (OpenCode), proposes changes as issue comments, implements only
+what a human explicitly approves, and opens pull requests. **It never merges.**
+
+The full requirements are in [SPEC.md](SPEC.md).
+
+## Status
+
+| Milestone                    | Scope                                                                                                                               | State       |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | ----------- |
+| 1 — Foundation               | project setup, SQLite + migrations, GitHub App auth, configuration, OpenCode connection, workspaces, health checks, logging, Docker | ✅ done     |
+| 2 — Discovery and approval   | scheduler, webhooks, job queue, issue analysis, proposals, `/ai` commands                                                           | not started |
+| 3 — Implementation           | worktree sessions, checks, commits, PRs                                                                                             | not started |
+| 4 — Review loop and features | review iterations, merge detection, feature proposals, recovery                                                                     | not started |
+
+## Architecture
+
+```text
+GitHub ──webhooks──▶ reverse proxy/tunnel ──▶ orchestrator (Docker, this repo)
+                                                │  SQLite: tasks, proposals, decisions, jobs, audit log
+                                                │  git: bare clones + one worktree per task
+                                                ▼
+                               OpenCode server (host, `opencode serve`)
+                               agents: maintainer-plan / maintainer-build
+```
+
+- **Orchestrator** (Node.js 22, TypeScript, Fastify) owns all workflow state, all
+  GitHub API calls and all git network operations. GitHub tokens never reach the
+  coding agent.
+- **OpenCode** runs as a separate, long-lived process on the host. The
+  orchestrator connects to it with the official `@opencode/client` package and
+  creates one session per task, confined to the task's worktree.
+- **SQLite** (Drizzle ORM, WAL mode) is the source of truth. OpenCode
+  conversation history is not.
+- Every task status change goes through `src/orchestrator/state-machine.ts` and
+  must name the event that justifies it (e.g. only an approval command can move
+  `AWAITING_APPROVAL → APPROVED`; only a merge event can reach `COMPLETED`).
+
+### Layout
+
+```text
+src/
+  index.ts              entry point (HTTP server, start-up checks, graceful shutdown)
+  app.ts                wiring of all components
+  cli.ts                operator CLI: pause / resume / status
+  config/               YAML + environment loading and validation (zod)
+  database/             schema, migrations, repository sync, task transitions, kill switch
+  github/app.ts         GitHub App auth, installation lookup, scoped tokens, access checks
+  opencode/client.ts    OpenCode connection (@opencode/client), session permissions
+  orchestrator/         task state machine
+  workspace/            git runner and bare-clone/worktree manager
+  http/server.ts        /healthz and /readyz
+  health.ts             readiness aggregation (cached external checks)
+config/repositories.example.yaml
+scripts/opencode-smoke.ts   manual end-to-end check against the real OpenCode server
+tests/                      unit and integration tests (vitest)
+```
+
+## Prerequisites
+
+- Linux host with Docker Compose, Node.js 22 and git.
+- A running OpenCode **2.2.x** server (`opencode serve`) with basic-auth password.
+  The `@opencode/client` version in `package.json` must match the server's
+  major.minor version; `/readyz` reports a mismatch.
+- A GitHub App (below).
+
+### OpenCode agents
+
+The maintainer uses two dedicated agents. Add them to the OpenCode config
+(`~/.config/opencode/opencode.jsonc`) and restart the server. They deny every
+tool by default (including all MCP servers and web access) and never leave the
+session directory:
+
+```jsonc
+"agent": {
+  "maintainer-plan": {
+    "mode": "primary",
+    "description": "AI maintainer: read-only analysis (automated)",
+    "permission": {
+      "*": "deny", "glob": "allow", "grep": "allow", "list": "allow", "lsp": "allow", "todowrite": "allow",
+      "read": { "*": "allow", "*.env": "deny", "*.env.*": "deny", "*.env.example": "allow" },
+      "external_directory": "deny", "webfetch": "deny", "websearch": "deny",
+      "question": "deny", "task": "deny", "skill": "deny", "doom_loop": "deny",
+      "edit": "deny", "bash": "deny"
+    }
+  },
+  "maintainer-build": {
+    "mode": "primary",
+    "description": "AI maintainer: implements approved proposals (automated)",
+    "permission": {
+      "*": "deny", "glob": "allow", "grep": "allow", "list": "allow", "lsp": "allow", "todowrite": "allow",
+      "read": { "*": "allow", "*.env": "deny", "*.env.*": "deny", "*.env.example": "allow" },
+      "external_directory": "deny", "webfetch": "deny", "websearch": "deny",
+      "question": "deny", "task": "deny", "skill": "deny", "doom_loop": "deny",
+      "edit": "allow",
+      "bash": { "*": "deny", "git status*": "allow", "git diff*": "allow", "git log*": "allow", "git show*": "allow", "ls*": "allow" }
+    }
+  }
+}
+```
+
+Each session additionally receives the deny-by-default rules in
+`BASE_SESSION_PERMISSIONS` (`src/opencode/client.ts`).
+
+### GitHub App
+
+1. github.com → Settings → Developer settings → GitHub Apps → **New GitHub App**.
+2. Webhook: leave inactive until Milestone 2 (needs a public HTTPS URL).
+3. Repository permissions — exactly these, nothing else:
+   - Contents: **Read and write**
+   - Issues: **Read and write**
+   - Pull requests: **Read and write**
+   - Metadata: Read-only
+     Never grant Administration or Workflows; `/readyz` fails if they are granted.
+4. Events (Milestone 2): Issues, Issue comment, Pull request, Pull request review,
+   Pull request review comment.
+5. "Only on this account" → Create. Note the **App ID**, generate a **private key**.
+6. **Install App** → _Only select repositories_ → the configured repositories.
+7. Put the App ID and the key into `.env` (see `.env.example`), then delete the
+   downloaded `.pem`.
+
+## Setup
+
+```sh
+cp .env.example .env && chmod 600 .env        # fill in the secrets
+cp config/repositories.example.yaml config/repositories.yaml
+mkdir -p /home/ubuntu/ai-maintainer-data/{db,workspaces}   # = DATA_DIR, owned by uid 1000
+docker compose up -d --build
+curl -s http://127.0.0.1:8787/readyz | jq
+```
+
+### Environment variables
+
+All secrets live in `.env` and nowhere else.
+
+| Variable                                                         | Required      | Default        | Purpose                                                            |
+| ---------------------------------------------------------------- | ------------- | -------------- | ------------------------------------------------------------------ |
+| `DATA_DIR`                                                       | yes (compose) | —              | Host directory for `db/` and `workspaces/`. Keep on the root disk. |
+| `HTTP_PORT`                                                      | no            | `8787`         | Host port, bound to 127.0.0.1.                                     |
+| `LOG_LEVEL`                                                      | no            | `info`         | `trace` … `fatal`.                                                 |
+| `GITHUB_APP_ID`                                                  | for readiness | —              | GitHub App ID.                                                     |
+| `GITHUB_APP_PRIVATE_KEY`                                         | for readiness | —              | App private key, one line with `\n`.                               |
+| `GITHUB_APP_PRIVATE_KEY_PATH`                                    | alternative   | —              | Path to a PEM file instead of the inline key.                      |
+| `GITHUB_WEBHOOK_SECRET`                                          | Milestone 2   | —              | Webhook signature secret.                                          |
+| `OPENCODE_SERVER_USERNAME`                                       | no            | `opencode`     | OpenCode basic-auth user.                                          |
+| `OPENCODE_SERVER_PASSWORD`                                       | yes           | —              | OpenCode basic-auth password.                                      |
+| `MAINTAINER_PAUSED`                                              | no            | `false`        | Kill switch that cannot be lifted at runtime.                      |
+| `CONFIG_PATH` / `DATABASE_PATH` / `WORKSPACE_ROOT` / `HTTP_HOST` | no            | set by compose | Overrides for local development.                                   |
+
+### Repository configuration
+
+`config/repositories.yaml` (validated at start-up; unknown keys are errors).
+Adding a repository needs only a new entry plus installing the App on it. Per
+repository you can set `commands` (test, lint, build, format, typecheck),
+`opencode` overrides (agents, model) and free-text `instructions`. See
+[config/repositories.example.yaml](config/repositories.example.yaml).
+
+`github.trusted_issue_authors` (default: `authorized_users`) limits which
+authors' issues are analysed automatically — important for public repositories.
+
+## Operations
+
+| Task                                          | Command                                                          |
+| --------------------------------------------- | ---------------------------------------------------------------- |
+| Liveness                                      | `curl http://127.0.0.1:8787/healthz`                             |
+| Readiness (DB, OpenCode, GitHub, kill switch) | `curl http://127.0.0.1:8787/readyz` (503 when not ready)         |
+| Pause everything                              | `docker compose exec maintainer node dist/cli.js pause "reason"` |
+| Resume                                        | `docker compose exec maintainer node dist/cli.js resume`         |
+| Status                                        | `docker compose exec maintainer node dist/cli.js status`         |
+| Logs (JSON)                                   | `docker compose logs -f maintainer`                              |
+
+Only the webhook route will ever be exposed publicly (Milestone 2). Never expose
+`/readyz` or the OpenCode API to the internet.
+
+## Development
+
+```sh
+npm ci                 # npm 11 required (npm 9/10 crash on this dependency tree)
+npm run check          # typecheck + lint + format check + tests
+npm run dev            # watch mode (needs .env values exported and local paths)
+npm run db:generate    # new migration after changing src/database/schema.ts
+
+# Manual end-to-end check against the real OpenCode server (uses a little model quota):
+OPENCODE_SERVER_PASSWORD=... OPENCODE_URL_OVERRIDE=http://127.0.0.1:4096 npm run smoke:opencode
+```
+
+Tests never touch real repositories: git tests use local `file://` remotes and
+GitHub/OpenCode are mocked at the HTTP level.
+
+## Deviations from SPEC.md and known limitations
+
+- **OpenCode package.** The spec names `@opencode-ai/sdk`; its newest release
+  (1.19.x) targets the OpenCode 1.x API and fails against OpenCode 2.x. This
+  project uses the official 2.x client `@opencode/client` (same repository,
+  version-matched to the server).
+- **Config location.** Repository configuration lives in top-level `config/`
+  (mounted read-only) instead of `src/config/`, so it can change without a rebuild.
+- **Extra tables.** `locks`, `feature_fingerprints`, `settings` (kill switch) and
+  `audit_log` complement the six tables of SPEC §5.
+- **Agent isolation is rule-based.** The coding agent runs inside the host's
+  OpenCode server as the host user; it is confined by OpenCode permission rules
+  (deny-by-default, no external directories, no MCP/web tools), not by an OS
+  sandbox.
+- **Structured output.** OpenCode 2.x has no JSON-schema response mode; answers
+  are requested as JSON and validated with zod before use (Milestone 2).

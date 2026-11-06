@@ -1,0 +1,67 @@
+# AI GitHub Maintainer — repository configuration.
+# Copy to config/repositories.yaml and adjust. Contains no secrets:
+# credentials come from environment variables (see .env.example).
+# Adding a repository = adding an entry here + installing the GitHub App on it.
+
+repositories:
+  - id: songbook
+    owner: xbankov
+    name: songbook
+    enabled: true
+    default_branch: main
+    max_concurrent_tasks: 1
+    # Commands run inside the task worktree (Milestone 3). Empty list = not applicable.
+    commands:
+      test: ["./.ai/validate.sh"]
+      lint: []
+      build: []
+      format: []
+      typecheck: []
+    opencode: {} # optional: analysis_agent, implementation_agent, model
+    instructions: |
+      Follow AGENTS.md in the repository root.
+
+  - id: home-server
+    owner: xbankov
+    name: home-server
+    enabled: true
+    default_branch: main
+    max_concurrent_tasks: 1
+    commands:
+      test: ["scripts/compose-validate.sh $(find services -name 'compose.y*ml')"]
+      lint: []
+      build: []
+      format: []
+      typecheck: []
+    opencode: {}
+    instructions: |
+      Follow AGENTS.md in the repository root. Never run staging on this host.
+
+github:
+  # Only these users may use /ai approve, /ai reject, /ai revise.
+  authorized_users:
+    - xbankov
+  # Only issues opened by these users are analysed automatically.
+  # Defaults to authorized_users when omitted.
+  # trusted_issue_authors: [xbankov]
+  proposal_label: ai-proposal
+
+discovery:
+  schedule: "0 8 * * *"
+  timezone: Europe/Berlin
+  issue_batch_size: 3
+  feature_suggestions: 3
+
+opencode:
+  # The orchestrator container reaches the host's OpenCode server through the Docker host gateway.
+  server_url: http://host.docker.internal:4096
+  analysis_agent: maintainer-plan
+  implementation_agent: maintainer-build
+  model: opencode-go/deepseek-v4.1-flash
+  request_timeout_ms: 15000
+
+limits:
+  max_review_iterations: 5
+  max_implementation_retries: 3
+  max_concurrent_implementations: 1
+  task_timeout_minutes: 60

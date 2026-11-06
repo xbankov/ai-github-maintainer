@@ -1,0 +1,41 @@
+# AI GitHub Maintainer — orchestrator.
+# Requires: .env (see .env.example) and config/repositories.yaml.
+# The OpenCode server runs on the host (not in this file) and is reached via host.docker.internal.
+
+services:
+  maintainer:
+    build: .
+    image: ai-github-maintainer:local
+    container_name: ai-github-maintainer
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      CONFIG_PATH: /config/repositories.yaml
+      DATABASE_PATH: ${DATA_DIR:?set DATA_DIR in .env}/db/maintainer.sqlite
+      # Same absolute path inside and outside the container: OpenCode (on the host)
+      # opens task worktrees by the path the orchestrator gives it.
+      WORKSPACE_ROOT: ${DATA_DIR}/workspaces
+    volumes:
+      - ./config:/config:ro
+      - ${DATA_DIR}/db:${DATA_DIR}/db
+      - ${DATA_DIR}/workspaces:${DATA_DIR}/workspaces
+    # Only reachable from this machine; the public webhook route is exposed by a
+    # reverse proxy / tunnel in Milestone 2. /readyz is never exposed publicly.
+    ports:
+      - "127.0.0.1:${HTTP_PORT:-8787}:8787"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
