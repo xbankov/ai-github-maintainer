@@ -187,13 +187,11 @@ describe("task transitions", () => {
 
   it("rejects invalid transitions without changing anything", () => {
     const db = freshDb();
-    const task = insertTask(db, 1, "AWAITING_APPROVAL");
+    const task = insertTask(db, 1, "DISCOVERED");
     expect(() =>
       transitionTask(db, { taskId: task.id, to: "COMPLETED", trigger: "pr_merged" }),
     ).toThrow(InvalidTransitionError);
-    expect(db.select().from(tasks).where(eq(tasks.id, task.id)).get()?.status).toBe(
-      "AWAITING_APPROVAL",
-    );
+    expect(db.select().from(tasks).where(eq(tasks.id, task.id)).get()?.status).toBe("DISCOVERED");
     expect(db.select().from(auditLog).where(eq(auditLog.taskId, task.id)).all()).toHaveLength(0);
   });
 

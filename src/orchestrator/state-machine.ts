@@ -78,14 +78,18 @@ const TRANSITIONS: TransitionTable = {
   ANALYZING: {
     AWAITING_APPROVAL: ["analysis_completed"],
     FAILED: ["analysis_failed"],
-    ABANDONED: ["issue_closed", "manual_abandon"],
+    // After a scope change the pull request already exists; a human may merge or close it.
+    COMPLETED: ["pr_merged"],
+    ABANDONED: ["issue_closed", "manual_abandon", "pr_closed_unmerged"],
   },
   AWAITING_APPROVAL: {
     APPROVED: ["approve_command"],
     // The maintainer replied in the OpenCode session; the agent works again.
     ANALYZING: ["revise_command", "issue_changed", "conversation_continued"],
     REJECTED: ["reject_command"],
-    ABANDONED: ["issue_closed", "manual_abandon"],
+    // After a scope change the pull request already exists; a human may merge or close it.
+    COMPLETED: ["pr_merged"],
+    ABANDONED: ["issue_closed", "manual_abandon", "pr_closed_unmerged"],
   },
   REJECTED: {
     // A rejected task is only reconsidered when the issue itself changes or a human asks for a revision.
@@ -98,15 +102,20 @@ const TRANSITIONS: TransitionTable = {
     // the approval no longer matches — re-analyse and require a new approval.
     ANALYZING: ["issue_changed", "revise_command"],
     FAILED: ["implementation_failed"],
-    ABANDONED: ["issue_closed", "manual_abandon"],
+    // After a scope change the pull request already exists; a human may merge or close it.
+    COMPLETED: ["pr_merged"],
+    ABANDONED: ["issue_closed", "manual_abandon", "pr_closed_unmerged"],
   },
   IMPLEMENTING: {
     TESTING: ["implementation_finished"],
+    // A human merged the pull request while the bot was still working on it.
+    COMPLETED: ["pr_merged"],
     FAILED: ["implementation_failed"],
     ABANDONED: ["issue_closed", "pr_closed_unmerged", "manual_abandon"],
   },
   TESTING: {
     IMPLEMENTING: ["checks_failed"],
+    COMPLETED: ["pr_merged"],
     PR_OPEN: ["pr_opened"],
     FAILED: ["implementation_failed"],
     ABANDONED: ["issue_closed", "pr_closed_unmerged", "manual_abandon"],

@@ -8,12 +8,12 @@ The full requirements are in [SPEC.md](SPEC.md).
 
 ## Status
 
-| Milestone                    | Scope                                                                                                                               | State       |
-| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | ----------- |
-| 1 — Foundation               | project setup, SQLite + migrations, GitHub App auth, configuration, OpenCode connection, workspaces, health checks, logging, Docker | ✅ done     |
-| 2 — Discovery and approval   | polling scheduler, job queue, label gate, issue analysis, proposals, `/ai` commands, status labels                                  | ✅ done     |
-| 3 — Implementation           | OpenCode session per issue, approval in OpenCode, draft PR, CI in GitHub Actions with fix rounds                                    | ✅ done     |
-| 4 — Review loop and features | review iterations, merge detection, feature proposals, recovery                                                                     | not started |
+| Milestone                    | Scope                                                                                                                               | State   |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| 1 — Foundation               | project setup, SQLite + migrations, GitHub App auth, configuration, OpenCode connection, workspaces, health checks, logging, Docker | ✅ done |
+| 2 — Discovery and approval   | polling scheduler, job queue, label gate, issue analysis, proposals, `/ai` commands, status labels                                  | ✅ done |
+| 3 — Implementation           | OpenCode session per issue, approval in OpenCode, draft PR, CI in GitHub Actions with fix rounds                                    | ✅ done |
+| 4 — Review loop and features | review rounds, PR approval stop, merge/close detection, cleanup, feature proposals                                                  | ✅ done |
 
 ## How it works
 
@@ -28,16 +28,21 @@ notes, the approved plan and the pull request.
    may ask questions there.
 3. You discuss in the session. If it waits for you for 30 minutes, the bot
    @mentions you on the issue with the session link.
-4. You approve in the session by typing **`/ai approve`** (or `/ai reject`).
-   The bot posts the approved plan on the issue, including how it differs from the
-   issue description.
-5. The same session implements the plan, the bot pushes `ai/issue-<n>` and opens a
+4. You approve **in your own words** in the session ("ok, implement it"). A strict
+   check accepts only a clear go-ahead. The bot posts the approved plan on the
+   issue, including how it differs from the issue description.
+5. The same session implements the plan; the bot pushes `ai/issue-<n>` and opens a
    **draft** pull request. CI runs in GitHub Actions; failures go back to the agent
-   (up to `max_implementation_retries` rounds).
-6. When CI passes, the PR is marked ready for review. **You review and merge.**
+   (up to `max_implementation_retries` rounds). Then the PR is ready for review.
+6. Review the PR. Maintainer review comments (or messages in the session) start
+   another round in the same session (up to `max_review_iterations`). Feedback that
+   goes beyond the approved plan goes back to the session for a new approval.
+7. When you approve the PR, the bot stops. **You merge.** After the merge the task
+   is completed, the repository is free for the next issue and the worktree is removed.
 
-Removing `ai:allowed` or closing the issue stops the work (a draft PR is closed).
-`/ai` comments on GitHub only get a reply with the session link.
+To stop or decline: close the issue, remove `ai:allowed`, or close the PR.
+When the repository is idle, the AI suggests up to 3 ideas as issues labelled
+`ai:proposal`; nothing happens with them unless you add `ai:allowed`.
 
 Status labels (set by the bot, display only): `ai:queued`, `ai:running`,
 `ai:waiting-for-input` (your turn in OpenCode), `ai:waiting-for-review` (PR).

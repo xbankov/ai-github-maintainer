@@ -18,7 +18,7 @@ import type { Job } from "../workers/queue.js";
 import { enqueue } from "../workers/queue.js";
 import { DeferJob, PermanentJobError } from "../workers/processor.js";
 import type { OrchestratorContext, Task } from "./context.js";
-import { buildCiFixPrompt, buildImplementationPrompt } from "./prompts.js";
+import { buildCiFixPrompt, buildImplementationPrompt, buildReviewPrompt } from "./prompts.js";
 import { sanitize, type Proposal } from "./proposal.js";
 
 export const IMPLEMENT_JOB = "implement-task";
@@ -30,6 +30,8 @@ export interface ImplementPayload {
   taskId: number;
   /** Set when CI failed and the agent must fix it. */
   ciFix?: { round: number; failures: string[]; logs: string };
+  /** Set when maintainers asked for changes on the pull request. */
+  review?: { round: number; feedback: string };
 }
 
 /** Paths the agent must never change; changes there are discarded before committing. */
@@ -152,7 +154,11 @@ export async function implementTask(
   await ctx.workspace.syncRepository(wsRepo, token);
   const worktree = await ctx.workspace.createWorktree(wsRepo, { taskKey: taskKey(task), branch });
   // The worktree was created when the conversation started: build on the latest default branch.
-  if (!payload.ciFix && (await ctx.workspace.commitsAhead(wsRepo, branch)) === 0) {
+  if (
+    !payload.ciFix &&
+    !payload.review &&
+    (await ctx.workspace.commitsAhead(wsRepo, branch)) === 0
+  ) {
     await ctx.workspace.resetToDefault(wsRepo, taskKey(task));
   }
   const issue = await getIssue(octokit, ref, task.githubIssueNumber);
@@ -160,22 +166,28 @@ export async function implementTask(
   const settings = opencodeSettingsFor(ctx.config, repo);
   const limits = ctx.config.file.limits;
 
-  const prompt = payload.ciFix
-    ? buildCiFixPrompt({
-        round: payload.ciFix.round,
-        maxRounds: limits.max_implementation_retries,
-        failures: payload.ciFix.failures,
-        logs: payload.ciFix.logs,
+  const prompt = payload.review
+    ? buildReviewPrompt({
+        round: payload.review.round,
+        maxRounds: ctx.config.file.limits.max_review_iterations,
+        feedback: payload.review.feedback,
       })
-    : buildImplementationPrompt({
-        repository: `${repo.owner}/${repo.name}`,
-        branch,
-        instructions: repo.instructions,
-        issue,
-        proposal,
-        version: approved.row.version,
-        approvedBy: approved.decision.githubUser,
-      });
+    : payload.ciFix
+      ? buildCiFixPrompt({
+          round: payload.ciFix.round,
+          maxRounds: limits.max_implementation_retries,
+          failures: payload.ciFix.failures,
+          logs: payload.ciFix.logs,
+        })
+      : buildImplementationPrompt({
+          repository: `${repo.owner}/${repo.name}`,
+          branch,
+          instructions: repo.instructions,
+          issue,
+          proposal,
+          version: approved.row.version,
+          approvedBy: approved.decision.githubUser,
+        });
 
   // The issue's conversation session continues with the build agent (one session per issue).
   const newSession = async () => {
@@ -208,7 +220,7 @@ export async function implementTask(
     sessionId = await newSession();
     summary = await ctx.opencode.run(
       sessionId,
-      payload.ciFix
+      payload.ciFix || payload.review
         ? buildImplementationPrompt({
             repository: `${repo.owner}/${repo.name}`,
             branch,
@@ -237,9 +249,11 @@ export async function implementTask(
   await ctx.workspace.commitAll(
     wsRepo,
     taskKey(task),
-    payload.ciFix
-      ? `Fix CI for #${issue.number} (round ${payload.ciFix.round})`
-      : `${title} (#${issue.number})\n\nImplements approved proposal v${approved.row.version} for #${issue.number}.`,
+    payload.review
+      ? `Address review round ${payload.review.round} for #${issue.number}`
+      : payload.ciFix
+        ? `Fix CI for #${issue.number} (round ${payload.ciFix.round})`
+        : `${title} (#${issue.number})\n\nImplements approved proposal v${approved.row.version} for #${issue.number}.`,
     { name: identity.botLogin, email: identity.botEmail },
   );
   if ((await ctx.workspace.commitsAhead(wsRepo, branch)) === 0) {
@@ -283,6 +297,7 @@ export async function implementTask(
     patch: {
       githubPrNumber: pr.number,
       ...(payload.ciFix ? { ciAttempts: payload.ciFix.round } : {}),
+      ...(payload.review ? { ciAttempts: 0 } : {}),
     },
     details: { pr: pr.number, commit: await ctx.workspace.headCommit(wsRepo, taskKey(current)) },
   });
@@ -293,6 +308,13 @@ export async function implementTask(
       ref,
       issue.number,
       `🤖 Draft pull request #${pr.number} opened for proposal v${approved.row.version}. It becomes ready for review when CI passes.`,
+    );
+  } else if (payload.review) {
+    await createComment(
+      octokit,
+      ref,
+      pr.number,
+      `🤖 Review round ${payload.review.round}:\n\n${sanitize(summary).slice(0, 3000) || "(no notes)"}`,
     );
   } else if (payload.ciFix) {
     await createComment(
@@ -415,6 +437,8 @@ export async function awaitCi(ctx: OrchestratorContext, job: Job): Promise<void>
     taskId: task.id,
     to: "PR_OPEN",
     trigger: "pr_opened",
+    // Reviews are counted from the moment the PR first became ready (not reset by later rounds).
+    ...(task.reviewCursor ? {} : { patch: { reviewCursor: new Date() } }),
     details: { pr: pr.number, ci: ci.state },
   });
   await ctx.syncStatusLabel(open);

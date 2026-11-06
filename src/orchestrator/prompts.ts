@@ -3,7 +3,13 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import type { IssueComment, IssueSummary } from "../github/issues.js";
-import { approvedPlanSchema, type Proposal } from "./proposal.js";
+import {
+  approvalCheckSchema,
+  approvedPlanSchema,
+  featureListSchema,
+  scopeCheckSchema,
+  type Proposal,
+} from "./proposal.js";
 
 /** prompts/ lives at the project root, next to src/ and dist/. */
 const PROMPTS_DIR = fileURLToPath(new URL("../../prompts/", import.meta.url));
@@ -146,4 +152,71 @@ export function buildCiFixPrompt(input: {
     logs: neutralise(clip(input.logs || "(no logs available)", PROMPT_LIMITS.comments)),
     nonce: randomBytes(6).toString("hex"),
   });
+}
+
+export function buildReviewPrompt(input: {
+  round: number;
+  maxRounds: number;
+  feedback: string;
+}): string {
+  return fill(template("review-feedback.md"), {
+    round: String(input.round),
+    maxRounds: String(input.maxRounds),
+    feedback: clip(input.feedback, PROMPT_LIMITS.comments),
+  });
+}
+
+/** Transient check: does the feedback stay within the approved plan? */
+export function buildScopeCheckPrompt(feedback: string): string {
+  return [
+    "A maintainer gave this feedback on the pull request:",
+    "",
+    clip(feedback, PROMPT_LIMITS.comments),
+    "",
+    "Does addressing it stay within the approved plan of this session (small corrections,",
+    "fixes, naming, tests), or does it substantially change the scope (new features,",
+    "different approach, much more work)?",
+    "Output exactly one JSON object and nothing else, validating against this JSON Schema:",
+    JSON.stringify(z.toJSONSchema(scopeCheckSchema, { io: "input" })),
+  ].join("\n");
+}
+
+export function buildFeaturePrompt(input: {
+  repository: string;
+  count: number;
+  previous: string[];
+  instructions: string;
+}): string {
+  return fill(template("suggest-feature.md"), {
+    repository: input.repository,
+    count: String(input.count),
+    previous: input.previous.length
+      ? input.previous.map((t) => `  - ${t.replace(/\s+/g, " ").slice(0, 150)}`).join("\n")
+      : "  (none)",
+    instructions: input.instructions.trim() || "(none)",
+  });
+}
+
+export function buildFeatureJsonPrompt(count: number, previousError?: string): string {
+  return [
+    `Now output your best ideas (at most ${count}) as exactly one JSON object and nothing else.`,
+    "It must validate against this JSON Schema:",
+    JSON.stringify(z.toJSONSchema(featureListSchema, { io: "input" })),
+    ...(previousError ? ["", "Your previous answer was rejected:", previousError, "Fix it."] : []),
+  ].join("\n");
+}
+
+/** Transient yes/no check: did the maintainer clearly approve implementing the plan? */
+export function buildApprovalCheckPrompt(messages: string[]): string {
+  return [
+    "These are the maintainer's newest messages in this session:",
+    "",
+    ...messages.map((m) => `> ${clip(m, 2000).replace(/\n/g, "\n> ")}`),
+    "",
+    "Did the maintainer clearly and explicitly approve implementing the plan now?",
+    'Answer true only for an unambiguous go-ahead (for example: "ok, implement it", "go ahead", "approved").',
+    "Answer false for questions, conditions, partial agreement, requests for changes, or anything unclear.",
+    "Output exactly one JSON object and nothing else, validating against this JSON Schema:",
+    JSON.stringify(z.toJSONSchema(approvalCheckSchema, { io: "input" })),
+  ].join("\n");
 }

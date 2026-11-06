@@ -72,7 +72,8 @@ export const configSchema = z
           ),
         /** Deprecated (replaced by allowed_label); accepted and ignored with a warning. */
         trusted_issue_authors: z.array(ghName).optional(),
-        proposal_label: z.string().min(1).default("ai-proposal"),
+        /** Label of issues the AI opens itself (feature proposals). Never processed without ai:allowed. */
+        proposal_label: z.string().min(1).default("ai:proposal"),
         api_url: z.url().default("https://api.github.com"),
       })
       .strict(),

@@ -30,7 +30,7 @@ describe("repository configuration", () => {
     expect(repo.default_branch).toBe("main");
     expect(repo.max_concurrent_tasks).toBe(1);
     expect(repo.commands.test).toEqual([]);
-    expect(cfg.github.proposal_label).toBe("ai-proposal");
+    expect(cfg.github.proposal_label).toBe("ai:proposal");
     expect(cfg.discovery.schedule).toBe("0 8 * * *");
     expect(cfg.limits.max_implementation_retries).toBe(3);
   });

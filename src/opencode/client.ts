@@ -160,7 +160,7 @@ export class OpenCode {
   ): Promise<string> {
     signal?.throwIfAborted();
     await this.client.session.prompt(
-      { sessionID: sessionId, text },
+      { sessionID: sessionId, text, metadata: { source: SERVICE_SOURCE } },
       this.timeout(undefined, signal),
     );
     try {
@@ -243,6 +243,10 @@ export class OpenCode {
 
   async interrupt(sessionId: string): Promise<void> {
     await this.client.session.interrupt({ sessionID: sessionId }, this.timeout());
+  }
+
+  async rename(sessionId: string, title: string): Promise<void> {
+    await this.client.session.update({ sessionID: sessionId, title }, this.timeout());
   }
 
   /** Switches the session to another agent and replaces its permission rules. */

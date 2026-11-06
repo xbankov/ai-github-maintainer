@@ -44,7 +44,8 @@ github:
     - VladoBaca
   # An issue is processed only after a maintainer adds this label.
   allowed_label: ai:allowed
-  proposal_label: ai-proposal
+  # Issues the AI opens itself (feature proposals); a maintainer adds ai:allowed to work on one.
+  proposal_label: ai:proposal
 
 discovery:
   schedule: "0 8 * * *"

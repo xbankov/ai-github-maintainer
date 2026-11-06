@@ -23,11 +23,20 @@ These decisions override the corresponding parts of this specification.
    `@opencode/client` package; `@opencode-ai/sdk` 1.x targets the OpenCode 1.x API.
 7. **OpenCode is the console** (§2.2, §2.3). Each issue gets one OpenCode
    session (analysis, discussion and implementation). The agent may ask the
-   maintainer questions there. Implementation is approved by typing
-   `/ai approve` (or `/ai reject`) in the session; the bot then posts the
+   maintainer questions there. The maintainer approves the implementation in
+   their own words in the session (a strict check accepts only a clear go-ahead;
+   this deliberately replaces "approval must never be inferred" for the private
+   session). To decline, the maintainer closes the issue. The bot then posts the
    approved plan on the issue, including how it differs from the description.
    `/ai` comments on GitHub are answered with the session link. After 30 minutes
    of waiting for input, the maintainer is @mentioned on the issue.
+9. **Review loop** (§2.5). Polled every 5 minutes: maintainer reviews, inline
+   comments, PR comments and new messages in the session start another round in
+   the same session; out-of-scope feedback goes back to the session for a new
+   approval; a maintainer's PR approval stops the bot; merge → COMPLETED, close →
+   ABANDONED (the `ai:allowed` label is removed so the issue does not restart).
+10. **Feature proposals** (§2.6) use the label `ai:proposal` and are created only
+   when the repository is idle and fewer than `feature_suggestions` are open.
 8. **Tests run in GitHub Actions** (§2.4). The bot opens a draft pull request,
    waits for CI, sends failures back to the agent (bounded rounds), and marks the
    PR ready for review when CI passes. AI-written code never runs on the server.

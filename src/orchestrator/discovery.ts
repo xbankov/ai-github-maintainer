@@ -30,6 +30,7 @@ import { closePullRequest } from "../github/pull-requests.js";
 import { handleCommandComment, unfinishedCommands } from "./approvals.js";
 import type { OrchestratorContext, Task } from "./context.js";
 import { issueFingerprint } from "./proposal.js";
+import { PR_TRACKED_STATES, reconcilePullRequest } from "./review-loop.js";
 
 export const SYNC_JOB = "sync-repository";
 export const syncDedupeKey = (repositoryId: string) => `sync:${repositoryId}`;
@@ -69,6 +70,7 @@ export interface SyncResult {
   abandoned: number[];
   reanalysed: number[];
   labelsCleared: number[];
+  pullRequests: string[];
 }
 
 /** One polling cycle for one repository. */
@@ -89,6 +91,7 @@ export async function syncRepository(
     abandoned: [],
     reanalysed: [],
     labelsCleared: [],
+    pullRequests: [],
   };
   const allowedLabel = ctx.config.file.github.allowed_label;
 
@@ -98,6 +101,11 @@ export async function syncRepository(
         name: allowedLabel,
         color: "5319e7",
         description: "AI maintainer: a maintainer allowed AI work on this issue",
+      },
+      {
+        name: ctx.config.file.github.proposal_label,
+        color: "bfdadc",
+        description: "AI maintainer: idea suggested by the AI (add ai:allowed to work on it)",
       },
     ]);
     ctx.labelsEnsured.add(repo.id);
@@ -132,7 +140,6 @@ export async function syncRepository(
   const maintainers = await ctx.maintainers(ref);
   const eligible = new Map<number, IssueSummary>();
   for (const issue of await listIssuesWithLabel(octokit, ref, allowedLabel)) {
-    if (issue.author?.login === identity.botLogin) continue; // own feature proposals are never auto-processed
     const cacheKey = `${repo.id}#${issue.number}`;
     let cached = ctx.labelActorCache.get(cacheKey);
     if (!cached || cached.updatedAt !== issue.updatedAt) {
@@ -153,7 +160,21 @@ export async function syncRepository(
   result.eligible = eligible.size;
   signal?.throwIfAborted();
 
-  // 3. Reconcile existing tasks with the current issue state.
+  // 3a. Pull requests first: merges and closes finish tasks before the issue checks below.
+  const withPr = ctx.db
+    .select()
+    .from(tasks)
+    .where(and(eq(tasks.repositoryId, repo.id), inArray(tasks.status, [...PR_TRACKED_STATES])))
+    .all()
+    .filter((t) => t.githubPrNumber);
+  for (const task of withPr) {
+    const outcome = await reconcilePullRequest(ctx, task);
+    if (outcome !== "none") result.pullRequests.push(`${task.githubPrNumber}:${outcome}`);
+    // A finished issue must not be picked up again in this same cycle.
+    if (outcome === "completed" || outcome === "abandoned") eligible.delete(task.githubIssueNumber);
+  }
+
+  // 3b. Reconcile existing tasks with the current issue state.
   const live = ctx.db
     .select()
     .from(tasks)
@@ -235,7 +256,8 @@ export async function syncRepository(
       .insert(tasks)
       .values({
         repositoryId: repo.id,
-        type: "issue",
+        // Issues the bot opened itself are feature proposals (worked on only because a maintainer allowed them).
+        type: issue.author?.login === identity.botLogin ? "feature" : "issue",
         githubIssueNumber: issue.number,
         status: "DISCOVERED",
       })
@@ -287,7 +309,8 @@ export async function syncRepository(
     result.started.length ||
     result.abandoned.length ||
     result.reanalysed.length ||
-    result.labelsCleared.length;
+    result.labelsCleared.length ||
+    result.pullRequests.length;
   if (busy) log.info(result, "sync complete");
   else log.debug(result, "sync complete");
   return result;
