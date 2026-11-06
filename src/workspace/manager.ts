@@ -202,6 +202,27 @@ export class WorkspaceManager {
     return created;
   }
 
+  /**
+   * Detached checkout of the latest default branch, for read-only analysis.
+   * Replaces any previous snapshot with the same key.
+   */
+  async createSnapshot(repo: WorkspaceRepo, key: string): Promise<WorktreeInfo> {
+    const dir = this.repoDir(repo);
+    if (!existsSync(join(dir, "HEAD"))) {
+      throw new WorkspaceError(`Repository ${repo.id} is not cloned; call syncRepository first`);
+    }
+    const path = this.worktreeDir(repo, key);
+    await this.removeWorktree(repo, { taskKey: key });
+    await mkdir(resolve(path, ".."), { recursive: true });
+    await this.git(
+      ["worktree", "add", "--detach", path, `refs/remotes/origin/${repo.defaultBranch}`],
+      dir,
+    );
+    const created = (await this.listWorktrees(repo)).find((w) => w.path === path);
+    if (!created) throw new WorkspaceError(`Snapshot ${path} was not registered`);
+    return created;
+  }
+
   /** Removes a task worktree and (by default) its local branch. Idempotent. */
   async removeWorktree(
     repo: WorkspaceRepo,

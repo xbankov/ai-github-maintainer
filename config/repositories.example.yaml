@@ -38,18 +38,21 @@ repositories:
       Follow AGENTS.md in the repository root. Never run staging on this host.
 
 github:
-  # Only these users may use /ai approve, /ai reject, /ai revise.
+  # Maintainers: may add the allowed label and use /ai approve, /ai reject, /ai revise.
   authorized_users:
     - xbankov
-  # Only issues opened by these users are analysed automatically.
-  # Defaults to authorized_users when omitted.
-  # trusted_issue_authors: [xbankov]
+    - VladoBaca
+  # An issue is processed only after a maintainer adds this label.
+  allowed_label: ai-allowed
   proposal_label: ai-proposal
 
 discovery:
   schedule: "0 8 * * *"
   timezone: Europe/Berlin
-  issue_batch_size: 3
+  # Polling replaces webhooks: GitHub is checked this often.
+  poll_interval_seconds: 300
+  # Issues in progress (being analysed or waiting for approval) per repository.
+  issue_batch_size: 1
   feature_suggestions: 3
 
 opencode:
@@ -65,3 +68,6 @@ limits:
   max_implementation_retries: 3
   max_concurrent_implementations: 1
   task_timeout_minutes: 60
+  analysis_timeout_minutes: 15
+  # Jobs running at the same time across all repositories (1 = one issue at a time).
+  max_parallel_jobs: 1

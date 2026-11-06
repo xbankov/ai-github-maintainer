@@ -92,8 +92,9 @@ const TRANSITIONS: TransitionTable = {
   },
   APPROVED: {
     IMPLEMENTING: ["implementation_started"],
-    // The issue changed after approval: the approval no longer matches, re-analyse and re-approve.
-    ANALYZING: ["issue_changed"],
+    // The issue changed, or a maintainer asked for a revision, after approval:
+    // the approval no longer matches — re-analyse and require a new approval.
+    ANALYZING: ["issue_changed", "revise_command"],
     FAILED: ["implementation_failed"],
     ABANDONED: ["issue_closed", "manual_abandon"],
   },

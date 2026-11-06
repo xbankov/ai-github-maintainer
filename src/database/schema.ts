@@ -112,7 +112,7 @@ export const jobs = sqliteTable(
     availableAt: integer("available_at", { mode: "timestamp_ms" }).notNull().default(nowMs),
     lockedAt: integer("locked_at", { mode: "timestamp_ms" }),
     lockedBy: text("locked_by"),
-    /** Idempotency key: at most one job per key (NULL = no de-duplication). */
+    /** Idempotency key: at most one pending/running job per key (NULL = no de-duplication). */
     dedupeKey: text("dedupe_key"),
     repositoryId: text("repository_id").references(() => repositories.id, { onDelete: "set null" }),
     lastError: text("last_error"),
@@ -121,7 +121,10 @@ export const jobs = sqliteTable(
   },
   (t) => [
     index("jobs_claim_idx").on(t.status, t.availableAt),
-    uniqueIndex("jobs_dedupe_uq").on(t.dedupeKey),
+    // At most one *active* job per key; finished jobs do not block new ones.
+    uniqueIndex("jobs_active_dedupe_uq")
+      .on(t.dedupeKey)
+      .where(sql.raw(`status in ('pending', 'running')`)),
     check("jobs_status_ck", inList("status", JOB_STATUSES)),
     check("jobs_attempts_ck", sql`${t.attempts} >= 0 and ${t.maxAttempts} >= 1`),
   ],

@@ -20,8 +20,6 @@ export interface AppConfig {
   file: FileConfig;
   /** null when the GitHub App is not configured yet (the service still starts, but is not ready). */
   github: GitHubAppCredentials | null;
-  /** Effective list of users whose issues are analysed automatically. */
-  trustedIssueAuthors: string[];
   paths: { config: string; database: string; workspaceRoot: string };
 }
 
@@ -75,7 +73,6 @@ export function buildAppConfig(env: Env, file: FileConfig, cwd = process.cwd()):
     env,
     file,
     github: loadGitHubCredentials(env),
-    trustedIssueAuthors: file.github.trusted_issue_authors ?? file.github.authorized_users,
     paths: {
       config: resolve(cwd, env.CONFIG_PATH),
       database: resolve(cwd, env.DATABASE_PATH),
