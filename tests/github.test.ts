@@ -14,6 +14,9 @@ const goodPermissions = {
   issues: "write",
   pull_requests: "write",
   metadata: "read",
+  actions: "read",
+  checks: "read",
+  statuses: "read",
 };
 
 function fakeGitHub(
@@ -170,7 +173,14 @@ describe("App permission policy", () => {
     expect(checkAppPermissions({ ...goodPermissions, issues: "read" })).toEqual([
       "missing permission issues:write (has read)",
     ]);
-    expect(checkAppPermissions({ metadata: "read" })).toHaveLength(3);
+    expect(checkAppPermissions({ metadata: "read" })).toHaveLength(6);
+  });
+
+  it("allows CI access only as read-only", () => {
+    expect(checkAppPermissions({ ...goodPermissions, actions: "write", checks: "write" })).toEqual([
+      "permission actions must be read-only (has write)",
+      "permission checks must be read-only (has write)",
+    ]);
   });
 
   it("flags forbidden permissions such as administration and workflows", () => {

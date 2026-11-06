@@ -174,6 +174,9 @@ export class FakeGitHub {
             issues: "write",
             pull_requests: "write",
             metadata: "read",
+            actions: "read",
+            checks: "read",
+            statuses: "read",
           },
         },
       };

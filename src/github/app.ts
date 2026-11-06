@@ -10,14 +10,20 @@ export const REQUIRED_PERMISSIONS = {
   issues: "write",
   pull_requests: "write",
   metadata: "read",
+  // Read CI results and logs of the bot's branches (tests run in GitHub Actions).
+  actions: "read",
+  checks: "read",
+  statuses: "read",
 } as const;
 
-/** Permissions the App must NOT have. Their presence makes the service unready. */
+/** Permissions that must never exceed read-only. */
+export const READ_ONLY_PERMISSIONS = ["actions", "checks", "statuses", "metadata"] as const;
+
+/** Permissions the App must NOT have at all. Their presence makes the service unready. */
 export const FORBIDDEN_PERMISSIONS = [
   "administration",
   "workflows",
   "secrets",
-  "actions",
   "environments",
   "organization_administration",
   "members",
@@ -60,6 +66,11 @@ export function checkAppPermissions(granted: Record<string, string>): string[] {
   for (const [perm, level] of Object.entries(REQUIRED_PERMISSIONS)) {
     if ((rank[granted[perm] ?? ""] ?? 0) < (rank[level] ?? 0)) {
       problems.push(`missing permission ${perm}:${level} (has ${granted[perm] ?? "none"})`);
+    }
+  }
+  for (const perm of READ_ONLY_PERMISSIONS) {
+    if (granted[perm] && granted[perm] !== "read") {
+      problems.push(`permission ${perm} must be read-only (has ${granted[perm]})`);
     }
   }
   for (const perm of FORBIDDEN_PERMISSIONS) {
