@@ -54,6 +54,8 @@ export class FakeGitHub {
   repoLabels = new Set<string>();
   /** Number of upcoming comment posts that fail with HTTP 500 (failure injection). */
   failCommentPosts = 0;
+  /** Number of upcoming label removals that fail with HTTP 500. */
+  failLabelDeletes = 0;
   /** Local bare repository standing in for the GitHub remote (PR head commits come from it). */
   originPath = "";
   pulls = new Map<
@@ -66,8 +68,46 @@ export class FakeGitHub {
       body: string;
       draft: boolean;
       state: "open" | "closed";
+      merged?: boolean;
     }
   >();
+  reviews = new Map<
+    number,
+    Array<{ id: number; user: FakeUser; state: string; body: string; submitted_at: string }>
+  >();
+  reviewComments = new Map<
+    number,
+    Array<{
+      id: number;
+      user: FakeUser;
+      body: string;
+      path: string;
+      line: number;
+      created_at: string;
+    }>
+  >();
+
+  review(pr: number, user: FakeUser, state: string, body = ""): void {
+    const list = this.reviews.get(pr) ?? [];
+    list.push({ id: this.nextCommentId++, user, state, body, submitted_at: this.tick() });
+    this.reviews.set(pr, list);
+  }
+
+  inlineComment(pr: number, user: FakeUser, path: string, body: string): void {
+    const list = this.reviewComments.get(pr) ?? [];
+    list.push({ id: this.nextCommentId++, user, body, path, line: 1, created_at: this.tick() });
+    this.reviewComments.set(pr, list);
+  }
+
+  /** A human merges the pull request (the issue closes through "Closes #N"). */
+  merge(pr: number, issue: number): void {
+    Object.assign(this.pulls.get(pr)!, { state: "closed", merged: true });
+    this.edit(issue, { state: "closed" });
+  }
+
+  closePr(pr: number): void {
+    this.pulls.get(pr)!.state = "closed";
+  }
   /** CI result per head commit; default: one passing check. */
   ci: (sha: string) => {
     checks: Array<{ id: number; name: string; status: string; conclusion: string | null }>;
@@ -96,7 +136,7 @@ export class FakeGitHub {
       body: p.body,
       draft: p.draft,
       state: p.state,
-      merged: false,
+      merged: Boolean(p.merged),
       html_url: `https://github.test/xbankov/repo/pull/${p.number}`,
     };
   }
@@ -294,6 +334,20 @@ export class FakeGitHub {
           .map((p) => this.pullJson(p.number)),
       };
     }
+    const prSub = /^\/pulls\/(\d+)\/(reviews|comments)$/.exec(sub);
+    if (method === "GET" && prSub) {
+      const n = Number(prSub[1]);
+      return {
+        body:
+          prSub[2] === "reviews" ? (this.reviews.get(n) ?? []) : (this.reviewComments.get(n) ?? []),
+      };
+    }
+    if (method === "POST" && sub === "/issues") {
+      const b = body as { title: string; body: string; labels: string[] };
+      const number = this.addIssue({ title: b.title, body: b.body, by: USERS.bot });
+      for (const l of b.labels) this.label(number, l, USERS.bot);
+      return { status: 201, body: { number } };
+    }
     const pull = /^\/pulls\/(\d+)$/.exec(sub);
     if (pull && this.pulls.has(Number(pull[1]))) {
       const p = this.pulls.get(Number(pull[1]))!;
@@ -362,6 +416,10 @@ export class FakeGitHub {
         return { body: issue.labels.map((name) => ({ name })) };
       }
       const del = /^\/labels\/(.+)$/.exec(rest);
+      if (method === "DELETE" && del && this.failLabelDeletes > 0) {
+        this.failLabelDeletes--;
+        return { status: 500, body: { message: "Server Error" } };
+      }
       if (method === "DELETE" && del) {
         if (!issue.labels.includes(del[1]!))
           return { status: 404, body: { message: "Label does not exist" } };

@@ -36,6 +36,20 @@
       "when": 1793976268070,
       "tag": "0004_session_conversation",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1793980297255,
+      "tag": "0005_task_review_cursor",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1793982117394,
+      "tag": "0006_task_feedback_cleanup",
+      "breakpoints": true
     }
   ]
 }

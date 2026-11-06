@@ -18,8 +18,9 @@ and discuss — you cannot change files.
 2. Explain your findings briefly and propose a plan: steps, affected files,
    risks, tests. Ask about anything you are unsure of.
 3. Discuss with the maintainer and refine the plan.
-4. The maintainer approves by typing `/ai approve` (or declines with
-   `/ai reject`). After approval the implementation continues in this session.
+4. The maintainer approves in their own words (for example "ok, implement it").
+   After approval the implementation continues in this session. To decline,
+   the maintainer simply closes the issue.
 
 Keep replies short and concrete.
 

@@ -1,4 +1,4 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, isNull, notInArray } from "drizzle-orm";
 import { repositories, settings, tasks } from "../database/schema.js";
 import { transitionTask } from "../database/tasks.js";
 import {
@@ -18,18 +18,22 @@ import { enqueue, hasActiveJob } from "../workers/queue.js";
 import { conversationDedupeKey, enqueueConversation, forwardIssueChange } from "./conversation.js";
 import { buildIssueChangedMessage } from "./prompts.js";
 import {
-  branchFor,
   ciDedupeKey,
   CI_JOB,
   enqueueImplementation,
   implementDedupeKey,
-  taskKey,
 } from "./implementation.js";
-import { releaseLock, repoLockName, taskLockOwner } from "../database/locks.js";
 import { closePullRequest } from "../github/pull-requests.js";
 import { handleCommandComment, unfinishedCommands } from "./approvals.js";
 import type { OrchestratorContext, Task } from "./context.js";
 import { issueFingerprint } from "./proposal.js";
+import {
+  cleanupTask,
+  dispatchFeedback,
+  PR_TRACKED_STATES,
+  reconcilePullRequest,
+  retryCleanups,
+} from "./review-loop.js";
 
 export const SYNC_JOB = "sync-repository";
 export const syncDedupeKey = (repositoryId: string) => `sync:${repositoryId}`;
@@ -69,6 +73,7 @@ export interface SyncResult {
   abandoned: number[];
   reanalysed: number[];
   labelsCleared: number[];
+  pullRequests: string[];
 }
 
 /** One polling cycle for one repository. */
@@ -89,6 +94,7 @@ export async function syncRepository(
     abandoned: [],
     reanalysed: [],
     labelsCleared: [],
+    pullRequests: [],
   };
   const allowedLabel = ctx.config.file.github.allowed_label;
 
@@ -98,6 +104,11 @@ export async function syncRepository(
         name: allowedLabel,
         color: "5319e7",
         description: "AI maintainer: a maintainer allowed AI work on this issue",
+      },
+      {
+        name: ctx.config.file.github.proposal_label,
+        color: "bfdadc",
+        description: "AI maintainer: idea suggested by the AI (add ai:allowed to work on it)",
       },
     ]);
     ctx.labelsEnsured.add(repo.id);
@@ -132,7 +143,6 @@ export async function syncRepository(
   const maintainers = await ctx.maintainers(ref);
   const eligible = new Map<number, IssueSummary>();
   for (const issue of await listIssuesWithLabel(octokit, ref, allowedLabel)) {
-    if (issue.author?.login === identity.botLogin) continue; // own feature proposals are never auto-processed
     const cacheKey = `${repo.id}#${issue.number}`;
     let cached = ctx.labelActorCache.get(cacheKey);
     if (!cached || cached.updatedAt !== issue.updatedAt) {
@@ -153,7 +163,41 @@ export async function syncRepository(
   result.eligible = eligible.size;
   signal?.throwIfAborted();
 
-  // 3. Reconcile existing tasks with the current issue state.
+  // 3a. Pull requests first: merges and closes finish tasks before the issue checks below.
+  const withPr = ctx.db
+    .select()
+    .from(tasks)
+    .where(and(eq(tasks.repositoryId, repo.id), inArray(tasks.status, [...PR_TRACKED_STATES])))
+    .all()
+    .filter((t) => t.githubPrNumber);
+  for (const task of withPr) {
+    const outcome = await reconcilePullRequest(ctx, task);
+    if (outcome !== "none") result.pullRequests.push(`${task.githubPrNumber}:${outcome}`);
+    // A finished issue must not be picked up again in this same cycle.
+    if (outcome === "completed" || outcome === "abandoned") {
+      eligible.delete(task.githubIssueNumber);
+      continue;
+    }
+    // The maintainer closed the issue or removed the label while a PR is open: stop too.
+    const current = ctx.task(task.id)!;
+    const reviewing = ["PR_OPEN", "CHANGES_REQUESTED", "READY_FOR_HUMAN_MERGE"].includes(
+      current.status,
+    );
+    if (reviewing && !eligible.has(current.githubIssueNumber)) {
+      if (await stopTask(ctx, current, allowedLabel))
+        result.abandoned.push(current.githubIssueNumber);
+    } else if (
+      current.status === "CHANGES_REQUESTED" &&
+      !hasActiveJob(ctx.db, implementDedupeKey(current.id))
+    ) {
+      // Recovery: a review round was recorded but not dispatched (e.g. after a crash).
+      await dispatchFeedback(ctx, current);
+    }
+  }
+  // Issues cleaned up just now lost their allowed label: do not restart them in this cycle.
+  for (const issue of await retryCleanups(ctx, repo.id)) eligible.delete(issue);
+
+  // 3b. Reconcile existing tasks with the current issue state.
   const live = ctx.db
     .select()
     .from(tasks)
@@ -213,20 +257,38 @@ export async function syncRepository(
   }
 
   // 4. Start new tasks for the oldest eligible issues, within the batch limit.
+  //    Any unfinished task (also with an open PR) means the issue is taken.
   const liveByIssue = new Map(
     ctx.db
       .select()
       .from(tasks)
-      .where(and(eq(tasks.repositoryId, repo.id), inArray(tasks.status, [...PRE_PR_STATES])))
+      .where(
+        and(eq(tasks.repositoryId, repo.id), notInArray(tasks.status, ["COMPLETED", "ABANDONED"])),
+      )
       .all()
       .map((t) => [t.githubIssueNumber, t]),
+  );
+  // A finished task whose cleanup (e.g. removing ai:allowed) is still pending blocks a restart.
+  const uncleaned = new Set(
+    ctx.db
+      .select({ n: tasks.githubIssueNumber })
+      .from(tasks)
+      .where(
+        and(
+          eq(tasks.repositoryId, repo.id),
+          inArray(tasks.status, ["COMPLETED", "ABANDONED"]),
+          isNull(tasks.cleanedAt),
+        ),
+      )
+      .all()
+      .map((t) => t.n),
   );
   let slots =
     ctx.config.file.discovery.issue_batch_size -
     [...liveByIssue.values()].filter((t) => (SLOT_STATES as readonly string[]).includes(t.status))
       .length;
   for (const issue of eligible.values()) {
-    if (liveByIssue.has(issue.number)) continue;
+    if (liveByIssue.has(issue.number) || uncleaned.has(issue.number)) continue;
     if (slots <= 0) {
       await setStatusLabel(octokit, ref, issue.number, issue.labels, "queued");
       continue;
@@ -235,7 +297,8 @@ export async function syncRepository(
       .insert(tasks)
       .values({
         repositoryId: repo.id,
-        type: "issue",
+        // Issues the bot opened itself are feature proposals (worked on only because a maintainer allowed them).
+        type: issue.author?.login === identity.botLogin ? "feature" : "issue",
         githubIssueNumber: issue.number,
         status: "DISCOVERED",
       })
@@ -287,7 +350,8 @@ export async function syncRepository(
     result.started.length ||
     result.abandoned.length ||
     result.reanalysed.length ||
-    result.labelsCleared.length;
+    result.labelsCleared.length ||
+    result.pullRequests.length;
   if (busy) log.info(result, "sync complete");
   else log.debug(result, "sync complete");
   return result;
@@ -302,9 +366,10 @@ async function stopTask(
   const ref = ctx.ref(ctx.repository(task.repositoryId));
   const octokit = await ctx.github.octokitFor(ref);
   const issue = await getIssue(octokit, ref, task.githubIssueNumber);
-  const trigger = issue.state === "closed" ? "issue_closed" : "manual_abandon";
+  const preferred = issue.state === "closed" ? "issue_closed" : "manual_abandon";
+  const trigger = canTransition(task.status, "ABANDONED", preferred) ? preferred : "manual_abandon";
   if (!canTransition(task.status, "ABANDONED", trigger)) return false;
-  transitionTask(ctx.db, {
+  const stopped = transitionTask(ctx.db, {
     taskId: task.id,
     to: "ABANDONED",
     trigger,
@@ -312,9 +377,7 @@ async function stopTask(
       reason: issue.state === "closed" ? "issue closed" : `label ${allowedLabel} removed`,
     },
   });
-  await setStatusLabel(octokit, ref, issue.number, issue.labels, null);
-  // Implementation already started: free the repository, close the bot's draft PR, clean up.
-  releaseLock(ctx.db, repoLockName(task.repositoryId), taskLockOwner(task.id));
+  // Close the bot's own pull request (it is never reopened), then clean up.
   if (task.githubPrNumber) {
     await closePullRequest(
       octokit,
@@ -322,12 +385,6 @@ async function stopTask(
       task.githubPrNumber,
       "🤖 Closed: the issue was closed or is no longer allowed for the AI maintainer.",
     );
-  }
-  if (task.branchName) {
-    const repo = ctx.repository(task.repositoryId);
-    await ctx.workspace
-      .removeWorktree(ctx.workspaceRepo(repo), { taskKey: taskKey(task), branch: branchFor(task) })
-      .catch(() => undefined);
   }
   if (issue.state === "open") {
     await createComment(
@@ -337,5 +394,8 @@ async function stopTask(
       `🤖 Stopped: the \`${allowedLabel}\` label was removed (or not added by a maintainer). Add it again to restart.`,
     );
   }
+  await cleanupTask(ctx, stopped).catch((err: unknown) =>
+    ctx.logger.warn({ taskId: task.id, err: (err as Error).message }, "cleanup failed; will retry"),
+  );
   return true;
 }

@@ -22,6 +22,7 @@ import {
 } from "./orchestrator/implementation.js";
 import { OrchestratorContext } from "./orchestrator/context.js";
 import { SYNC_JOB, syncRepository } from "./orchestrator/discovery.js";
+import { discoverFeatures, FEATURE_JOB } from "./orchestrator/feature-discovery.js";
 import { Scheduler } from "./orchestrator/scheduler.js";
 import { JobProcessor } from "./workers/processor.js";
 import { WorkspaceManager, type WorkspaceRepo } from "./workspace/manager.js";
@@ -130,6 +131,7 @@ export async function createApplication(
         jobTimeouts: {
           [IMPLEMENT_JOB]: (limits.task_timeout_minutes + 10) * 60_000,
           [CI_JOB]: 5 * 60_000,
+          [FEATURE_JOB]: (limits.analysis_timeout_minutes * 2 + 10) * 60_000,
         },
         handlers: {
           [SYNC_JOB]: async (job, signal) => {
@@ -138,6 +140,9 @@ export async function createApplication(
           [CONVERSATION_JOB]: (job, signal) => conversationStep(orchestrator, job, signal),
           [IMPLEMENT_JOB]: (job, signal) => implementTask(orchestrator, job, signal),
           [CI_JOB]: (job) => awaitCi(orchestrator, job),
+          [FEATURE_JOB]: async (job, signal) => {
+            await discoverFeatures(orchestrator, job, signal);
+          },
         },
         onDead: async (job) => {
           if (job.type === CONVERSATION_JOB) await onConversationDead(orchestrator, job);
@@ -156,6 +161,7 @@ export async function createApplication(
         dailySchedule: config.file.discovery.schedule,
         timezone: config.file.discovery.timezone,
         envPaused: config.env.MAINTAINER_PAUSED,
+        featureSuggestions: config.file.discovery.feature_suggestions,
       })
     : null;
 

@@ -108,11 +108,11 @@ export class OrchestratorContext {
       case "ANALYZING":
       case "IMPLEMENTING":
       case "TESTING":
+      case "CHANGES_REQUESTED":
         return "running";
       case "AWAITING_APPROVAL":
         return "input";
       case "PR_OPEN":
-      case "CHANGES_REQUESTED":
       case "READY_FOR_HUMAN_MERGE":
         return "waiting";
       default:

@@ -56,6 +56,12 @@ export const tasks = sqliteTable(
     opencodeSessionId: text("opencode_session_id"),
     /** Creation time of the last session message the service has processed. */
     sessionCursor: integer("session_cursor", { mode: "timestamp_ms" }),
+    /** Review feedback of the current round, kept until it is pushed (survives restarts). */
+    pendingFeedback: text("pending_feedback"),
+    /** Set when the cleanup after COMPLETED/ABANDONED (worktree, label, lock) succeeded. */
+    cleanedAt: integer("cleaned_at", { mode: "timestamp_ms" }),
+    /** GitHub time of the last pull-request review/comment the service has processed. */
+    reviewCursor: integer("review_cursor", { mode: "timestamp_ms" }),
     /** When the maintainer was last notified that the session waits for input. */
     inputNotifiedAt: integer("input_notified_at", { mode: "timestamp_ms" }),
     branchName: text("branch_name"),

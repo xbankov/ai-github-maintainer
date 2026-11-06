@@ -5,6 +5,7 @@ import type { Logger } from "../logger.js";
 import type { RepositoryConfig } from "../config/schema.js";
 import { enqueue } from "../workers/queue.js";
 import { SYNC_JOB, syncDedupeKey } from "./discovery.js";
+import { enqueueFeatureDiscovery } from "./feature-discovery.js";
 
 /**
  * Polling replaces webhooks: every `pollIntervalSeconds` each enabled repository
@@ -25,6 +26,8 @@ export class Scheduler {
       dailySchedule: string;
       timezone: string;
       envPaused: boolean;
+      /** Feature proposals per repository (0 disables feature discovery). */
+      featureSuggestions?: number;
     },
   ) {
     this.log = options.logger.child({ component: "scheduler" });
@@ -47,6 +50,15 @@ export class Scheduler {
     return created;
   }
 
+  /** Daily feature discovery, a little after the sync (it only runs when a repository is idle). */
+  enqueueFeatureDiscovery(): void {
+    if (getKillSwitch(this.options.db, this.options.envPaused).paused) return;
+    if ((this.options.featureSuggestions ?? 0) <= 0) return;
+    for (const repo of this.options.repositories.filter((r) => r.enabled)) {
+      enqueueFeatureDiscovery(this.options, repo.id, 2 * 60_000);
+    }
+  }
+
   start(): void {
     if (!cron.validate(this.options.dailySchedule)) {
       throw new Error(`Invalid discovery.schedule "${this.options.dailySchedule}"`);
@@ -60,6 +72,7 @@ export class Scheduler {
       this.options.dailySchedule,
       () => {
         const n = this.enqueueSyncs("daily");
+        this.enqueueFeatureDiscovery();
         this.log.info({ enqueued: n }, "daily discovery");
       },
       { timezone: this.options.timezone },

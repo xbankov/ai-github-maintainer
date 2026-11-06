@@ -242,3 +242,44 @@ export async function setStatusLabel(
     });
   }
 }
+
+/** Removes a label from an issue (no error if it is not there). */
+export async function removeLabel(
+  octokit: Octokit,
+  repo: RepoRef,
+  number: number,
+  name: string,
+): Promise<void> {
+  await octokit
+    .request("DELETE /repos/{owner}/{repo}/issues/{issue_number}/labels/{name}", {
+      ...params(repo),
+      issue_number: number,
+      name,
+    })
+    .catch((err: { status?: number }) => {
+      if (err.status !== 404) throw err;
+    });
+}
+
+/** Opens an issue as the bot (feature proposals). */
+export async function createIssue(
+  octokit: Octokit,
+  repo: RepoRef,
+  input: { title: string; body: string; labels: string[] },
+): Promise<number> {
+  const { data } = await octokit.request("POST /repos/{owner}/{repo}/issues", {
+    ...params(repo),
+    ...input,
+  });
+  return Number(data.number);
+}
+
+/** Titles of all open issues (for duplicate checks). */
+export async function listOpenIssueTitles(octokit: Octokit, repo: RepoRef): Promise<string[]> {
+  const raw = (await octokit.paginate("GET /repos/{owner}/{repo}/issues", {
+    ...params(repo),
+    state: "open",
+    per_page: 100,
+  })) as RawIssue[];
+  return raw.filter((i) => !i.pull_request).map((i) => i.title);
+}

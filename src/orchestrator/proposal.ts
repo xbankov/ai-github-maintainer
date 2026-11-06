@@ -47,6 +47,63 @@ const requirePlan = (
 export const proposalSchema = z.object(proposalFields).superRefine(requirePlan);
 export type Proposal = z.infer<typeof proposalSchema>;
 
+/** Result of the approval check on the maintainer's messages. */
+export const approvalCheckSchema = z.object({
+  approved: z.boolean(),
+  reason: z.string().max(500).default(""),
+});
+
+/** Result of the review scope check. */
+export const scopeCheckSchema = z.object({
+  within_scope: z.boolean(),
+  reason: z.string().min(1).max(1000),
+});
+
+/** Feature proposals from feature discovery (SPEC §2.6). */
+export const featureSchema = z.object({
+  title: z.string().min(5).max(120),
+  problem: z.string().min(1).max(2000).describe("Problem or opportunity"),
+  why: z.string().min(1).max(2000).describe("Why it matters"),
+  implementation: z.string().min(1).max(3000).describe("Suggested implementation"),
+  benefit: z.string().min(1).max(1000).describe("Expected benefit"),
+  complexity: z.enum(["small", "medium", "large"]),
+  risks: z.array(z.string().min(1).max(500)).max(10),
+});
+export type Feature = z.infer<typeof featureSchema>;
+export const featureListSchema = z.object({ features: z.array(featureSchema).max(10) });
+
+/**
+ * Normalised title fingerprint: the same idea with different casing, accents,
+ * punctuation or word order maps to the same value; every other word counts.
+ */
+export function featureFingerprint(title: string): string {
+  const stop = new Set(["a", "an", "the", "and", "or", "for", "to", "of", "in", "on", "with"]);
+  const words = title
+    .normalize("NFKD")
+    .replace(/\p{M}/gu, "")
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter((w) => w && !stop.has(w));
+  return createHash("sha256")
+    .update([...new Set(words)].sort().join(" "))
+    .digest("hex");
+}
+
+export function renderFeatureIssue(f: Feature): string {
+  return [
+    `**Problem or opportunity**\n${sanitize(f.problem)}`,
+    `**Why it matters**\n${sanitize(f.why)}`,
+    `**Suggested implementation**\n${sanitize(f.implementation)}`,
+    `**Expected benefit**\n${sanitize(f.benefit)}`,
+    `**Complexity:** ${f.complexity}`,
+    f.risks.length ? `**Risks**\n${list(f.risks)}` : "",
+    "---",
+    "🤖 Suggested by the AI maintainer. Nothing happens unless a maintainer adds `ai:allowed`.",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
 /** The plan the maintainer approved in the OpenCode session. */
 export const approvedPlanSchema = z
   .object({

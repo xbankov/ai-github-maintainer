@@ -9,8 +9,13 @@ import { enqueue } from "../workers/queue.js";
 import { DeferJob, PermanentJobError } from "../workers/processor.js";
 import type { OrchestratorContext, Task } from "./context.js";
 import { branchFor, enqueueImplementation, taskKey } from "./implementation.js";
-import { buildApprovedPlanPrompt, buildConversationPrompt } from "./prompts.js";
 import {
+  buildApprovalCheckPrompt,
+  buildApprovedPlanPrompt,
+  buildConversationPrompt,
+} from "./prompts.js";
+import {
+  approvalCheckSchema,
   approvedPlanSchema,
   isImplementable,
   issueFingerprint,
@@ -23,7 +28,7 @@ import {
 /**
  * One OpenCode session per issue is the maintainer's console: the agent
  * investigates and discusses there, the maintainer answers privately in the
- * OpenCode UI and approves with `/ai approve`. GitHub only gets short status
+ * OpenCode UI and approves in their own words. GitHub only gets short status
  * notes, the approved plan and the pull request.
  */
 export const CONVERSATION_JOB = "conversation";
@@ -31,7 +36,6 @@ export const conversationDedupeKey = (taskId: number) => `conversation:${taskId}
 
 const POLL_MS = 60_000;
 const PLAN_ATTEMPTS = 3;
-const COMMAND = /^\s*\/ai\s+(approve|reject)\b/i;
 
 /** Read-only phase: the agent may read and ask questions, nothing else. */
 export const CONVERSATION_PERMISSIONS: PermissionRule[] = [
@@ -83,23 +87,18 @@ export async function conversationStep(
   const messages = await ctx.opencode.messages(sessionId);
   const cursor = task.sessionCursor?.getTime() ?? task.createdAt.getTime();
   const newHuman = messages.filter((m) => m.kind === "human" && m.created > cursor);
-  const command = [...newHuman].reverse().find((m) => COMMAND.test(m.text));
   const lastHuman = newHuman.at(-1);
   if (lastHuman) {
+    // The maintainer approves in their own words; a strict check decides whether they did.
+    // The cursor moves only after the check, so a failed check is retried with the same messages.
+    const approved = await isApproval(ctx, sessionId, newHuman, signal);
+    const applied = approved && (await approveInSession(ctx, task, lastHuman, signal));
     ctx.db
       .update(tasks)
       .set({ sessionCursor: new Date(lastHuman.created) })
       .where(eq(tasks.id, task.id))
       .run();
-  }
-  if (command) {
-    const verb = COMMAND.exec(command.text)![1]!.toLowerCase();
-    if (verb === "approve") {
-      if (await approveInSession(ctx, task, command, signal)) return;
-    } else {
-      await rejectInSession(ctx, task, command);
-      return;
-    }
+    if (applied) return;
     task = ctx.task(task.id)!;
   }
 
@@ -217,7 +216,31 @@ async function tell(ctx: OrchestratorContext, task: Task, text: string) {
 }
 
 /**
- * `/ai approve` typed in the session: write down the agreed plan, record the
+ * Strict check of the maintainer's new messages: only an unambiguous go-ahead
+ * to implement counts as approval (questions, conditions or change requests do not).
+ */
+async function isApproval(
+  ctx: OrchestratorContext,
+  sessionId: string,
+  messages: SessionMessage[],
+  signal: AbortSignal,
+): Promise<boolean> {
+  const timeoutMs = ctx.config.file.limits.analysis_timeout_minutes * 60_000;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const reply = await ctx.opencode.generate(
+      sessionId,
+      buildApprovalCheckPrompt(messages.map((m) => m.text)),
+      timeoutMs,
+      signal,
+    );
+    const parsed = parseStructured(reply, approvalCheckSchema);
+    if (parsed.ok) return parsed.value.approved;
+  }
+  return false; // when in doubt, it is not an approval
+}
+
+/**
+ * The maintainer approved in the session: write down the agreed plan, record the
  * decision, publish the plan on the issue and start the implementation.
  * Returns false when the approval could not be applied (the maintainer is told why).
  */
@@ -260,8 +283,8 @@ async function approveInSession(
         ctx,
         task,
         plan
-          ? "Approval not applied: the agreed plan has no implementation steps or the issue was judged invalid. Refine the plan, then type `/ai approve` again."
-          : "Approval not applied: I could not write down the agreed plan. Please type `/ai approve` again.",
+          ? "Approval not applied: the agreed plan has no implementation steps or the issue was judged invalid. Refine the plan, then approve again."
+          : "Approval not applied: I could not write down the agreed plan. Please confirm the approval again.",
       );
       return false;
     }
@@ -353,49 +376,6 @@ async function approveInSession(
     );
   }
   return true;
-}
-
-async function rejectInSession(ctx: OrchestratorContext, task: Task, command: SessionMessage) {
-  const repo = ctx.repository(task.repositoryId);
-  const ref = ctx.ref(repo);
-  const octokit = await ctx.github.octokitFor(ref);
-  const operator = operatorLogin(ctx);
-  if (!ctx.db.select().from(decisions).where(eq(decisions.sessionMessageId, command.id)).get()) {
-    let current = ctx.task(task.id)!;
-    if (current.status === "ANALYZING") {
-      current = transitionTask(ctx.db, {
-        taskId: current.id,
-        to: "AWAITING_APPROVAL",
-        trigger: "analysis_completed",
-      });
-    }
-    const rejected = transitionTask(ctx.db, {
-      taskId: current.id,
-      to: "REJECTED",
-      trigger: "reject_command",
-      actor: `opencode:${operator}`,
-      within: (tx) => {
-        tx.insert(decisions)
-          .values({
-            taskId: current.id,
-            proposalVersion: current.proposalVersion,
-            decision: "reject",
-            githubUser: operator,
-            githubUserId: 0,
-            source: "opencode",
-            sessionMessageId: command.id,
-          })
-          .run();
-      },
-    });
-    await ctx.syncStatusLabel(rejected);
-    await createComment(
-      octokit,
-      ref,
-      task.githubIssueNumber,
-      `🤖 Declined by @${operator} in OpenCode. Nothing will be implemented.`,
-    );
-  }
 }
 
 /** The issue text changed on GitHub: tell the agent in the session. */

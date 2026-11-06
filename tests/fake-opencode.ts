@@ -59,6 +59,17 @@ export class FakeOpenCode {
     JSON.stringify(defaultPlan(/#\d+ — (.*)/.exec(s.title)?.[1] ?? "x"));
   /** Whether the build agent changes files when prompted. */
   editsFiles = true;
+  /** Approval check: does this text approve? Default: a clear go-ahead without a question. */
+  approves: (messages: string[]) => boolean = (messages) =>
+    messages.some(
+      (m) => /\b(implement it|go ahead|approved?|ship it)\b/i.test(m) && !m.includes("?"),
+    );
+  /** Review scope check result. */
+  withinScope = true;
+  /** Feature ideas returned by feature discovery. */
+  features: Array<{ title: string }> = [];
+  /** Called when feature ideas are produced (to simulate things happening meanwhile). */
+  onFeatures?: () => void;
   /** Extra files the build agent writes (path relative to the worktree → content). */
   extraFiles: Record<string, string> = {};
   private nextId = 1;
@@ -150,6 +161,7 @@ export class FakeOpenCode {
         return { status: 204 };
       case "PATCH ":
         s.permissions = (body as { permissions?: unknown[] }).permissions ?? s.permissions;
+        s.title = (body as { title?: string }).title ?? s.title;
         return { status: 204 };
       case "POST /agent":
         s.agent = (body as { agent: string }).agent;
@@ -196,6 +208,43 @@ export class FakeOpenCode {
       case "GET /context":
         return { body: { data: s.messages } };
       case "POST /generate": {
+        const prompt = (body as { prompt: string }).prompt;
+        if (prompt.includes("clearly and explicitly approve")) {
+          const quoted = prompt
+            .split("\n")
+            .filter((l) => l.startsWith("> "))
+            .map((l) => l.slice(2));
+          return {
+            body: {
+              data: { text: JSON.stringify({ approved: this.approves(quoted), reason: "" }) },
+            },
+          };
+        }
+        if (prompt.includes("stay within the approved plan")) {
+          return {
+            body: {
+              data: {
+                text: JSON.stringify({
+                  within_scope: this.withinScope,
+                  reason: "needs a new page",
+                }),
+              },
+            },
+          };
+        }
+        if (prompt.includes("output your best ideas")) {
+          this.onFeatures?.();
+          const features = this.features.map((f) => ({
+            problem: "p",
+            why: "w",
+            implementation: "i",
+            benefit: "b",
+            complexity: "small",
+            risks: [],
+            ...f,
+          }));
+          return { body: { data: { text: JSON.stringify({ features }) } } };
+        }
         const n = (this.generateCalls.get(s.id) ?? 0) + 1;
         this.generateCalls.set(s.id, n);
         return { body: { data: { text: this.plan(s, n) } } };

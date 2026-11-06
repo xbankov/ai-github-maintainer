@@ -161,7 +161,7 @@ describe("OpenCode integration (@opencode/client)", () => {
       "POST /api/experimental/session/ses_1/wait",
       "GET /api/session/ses_1/context",
     ]);
-    expect(mock.calls[0]!.body).toEqual({ text: "do it" });
+    expect(mock.calls[0]!.body).toEqual({ text: "do it", metadata: { source: "ai-maintainer" } });
   });
 
   it("generates and deletes", async () => {

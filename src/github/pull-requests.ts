@@ -217,3 +217,78 @@ export async function getJobLogTail(
   const clean = text.replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z /gm, "");
   return clean.length > maxChars ? `[…]\n${clean.slice(-maxChars)}` : clean;
 }
+
+export interface PullReview {
+  id: number;
+  user: { login: string; id: number } | null;
+  state: "APPROVED" | "CHANGES_REQUESTED" | "COMMENTED" | "DISMISSED" | "PENDING";
+  body: string;
+  submittedAt: string;
+}
+
+export interface PullReviewComment {
+  id: number;
+  reviewId: number | null;
+  user: { login: string; id: number } | null;
+  body: string;
+  path: string;
+  line: number | null;
+  createdAt: string;
+}
+
+export async function listReviews(
+  octokit: Octokit,
+  repo: RepoRef,
+  number: number,
+): Promise<PullReview[]> {
+  const raw = (await octokit.paginate("GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews", {
+    ...params(repo),
+    pull_number: number,
+    per_page: 100,
+  })) as Array<{
+    id: number;
+    user?: { login: string; id: number } | null;
+    state: string;
+    body?: string | null;
+    submitted_at?: string | null;
+  }>;
+  return raw
+    .filter((r) => r.submitted_at)
+    .map((r) => ({
+      id: Number(r.id),
+      user: r.user ? { login: r.user.login, id: Number(r.user.id) } : null,
+      state: r.state as PullReview["state"],
+      body: r.body ?? "",
+      submittedAt: r.submitted_at!,
+    }));
+}
+
+/** Inline review comments (on lines of the diff). */
+export async function listReviewComments(
+  octokit: Octokit,
+  repo: RepoRef,
+  number: number,
+): Promise<PullReviewComment[]> {
+  const raw = (await octokit.paginate("GET /repos/{owner}/{repo}/pulls/{pull_number}/comments", {
+    ...params(repo),
+    pull_number: number,
+    per_page: 100,
+  })) as Array<{
+    id: number;
+    pull_request_review_id?: number | null;
+    user?: { login: string; id: number } | null;
+    body: string;
+    path: string;
+    line?: number | null;
+    created_at: string;
+  }>;
+  return raw.map((c) => ({
+    id: Number(c.id),
+    reviewId: c.pull_request_review_id ?? null,
+    user: c.user ? { login: c.user.login, id: Number(c.user.id) } : null,
+    body: c.body,
+    path: c.path,
+    line: c.line ?? null,
+    createdAt: c.created_at,
+  }));
+}
