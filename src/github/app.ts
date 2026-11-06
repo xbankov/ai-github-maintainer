@@ -198,7 +198,7 @@ export class GitHubApp {
         }
         if (!data.private) {
           result.warnings.push(
-            "repository is public: anyone can open issues; only trusted_issue_authors are analysed",
+            "repository is public: anyone can open issues; only issues a maintainer labels are processed",
           );
         }
         if (!checkedInstallations.has(result.installationId)) {

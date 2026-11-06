@@ -8,7 +8,12 @@ import { HealthMonitor } from "./health.js";
 import { buildHttpServer } from "./http/server.js";
 import type { Logger } from "./logger.js";
 import { OpenCode } from "./opencode/client.js";
-import { WorkspaceManager } from "./workspace/manager.js";
+import { ANALYZE_JOB, analyzeIssue, onAnalysisDead } from "./orchestrator/analysis.js";
+import { OrchestratorContext } from "./orchestrator/context.js";
+import { SYNC_JOB, syncRepository } from "./orchestrator/discovery.js";
+import { Scheduler } from "./orchestrator/scheduler.js";
+import { JobProcessor } from "./workers/processor.js";
+import { WorkspaceManager, type WorkspaceRepo } from "./workspace/manager.js";
 
 export interface Application {
   config: AppConfig;
@@ -18,6 +23,12 @@ export interface Application {
   workspace: WorkspaceManager;
   health: HealthMonitor;
   http: FastifyInstance;
+  /** Null until the GitHub App is configured. */
+  orchestrator: OrchestratorContext | null;
+  processor: JobProcessor | null;
+  scheduler: Scheduler | null;
+  /** Starts polling and job processing (no-op without GitHub). */
+  startWorkers(): void;
   close(): Promise<void>;
 }
 
@@ -26,6 +37,8 @@ export interface CreateAppOverrides {
   githubFetch?: typeof globalThis.fetch;
   /** Injected fetch for OpenCode (tests). */
   opencodeFetch?: typeof globalThis.fetch;
+  /** Clone URL override (tests use file:// remotes). */
+  remoteUrl?: (repo: WorkspaceRepo) => string;
 }
 
 /** Builds every component and runs the start-up steps that need no network. */
@@ -66,7 +79,11 @@ export async function createApplication(
     : null;
   if (!github) logger.warn("GitHub App is not configured; the service will report not ready");
 
-  const workspace = new WorkspaceManager({ root: config.paths.workspaceRoot, logger });
+  const workspace = new WorkspaceManager({
+    root: config.paths.workspaceRoot,
+    logger,
+    remoteUrl: overrides.remoteUrl,
+  });
   await workspace.init();
 
   const health = new HealthMonitor({
@@ -88,6 +105,40 @@ export async function createApplication(
 
   const http = buildHttpServer({ logger, health });
 
+  const orchestrator = github
+    ? new OrchestratorContext(config, db, github, opencode, workspace, logger)
+    : null;
+  const limits = config.file.limits;
+  const processor = orchestrator
+    ? new JobProcessor({
+        db,
+        logger,
+        envPaused: config.env.MAINTAINER_PAUSED,
+        jobTimeoutMs: (limits.analysis_timeout_minutes + 10) * 60_000,
+        concurrency: limits.max_parallel_jobs,
+        handlers: {
+          [SYNC_JOB]: async (job, signal) => {
+            await syncRepository(orchestrator, job, signal);
+          },
+          [ANALYZE_JOB]: (job, signal) => analyzeIssue(orchestrator, job, signal),
+        },
+        onDead: async (job) => {
+          if (job.type === ANALYZE_JOB) await onAnalysisDead(orchestrator, job);
+        },
+      })
+    : null;
+  const scheduler = orchestrator
+    ? new Scheduler({
+        db,
+        logger,
+        repositories: config.file.repositories,
+        pollIntervalSeconds: config.file.discovery.poll_interval_seconds,
+        dailySchedule: config.file.discovery.schedule,
+        timezone: config.file.discovery.timezone,
+        envPaused: config.env.MAINTAINER_PAUSED,
+      })
+    : null;
+
   return {
     config,
     db,
@@ -96,7 +147,20 @@ export async function createApplication(
     workspace,
     health,
     http,
+    orchestrator,
+    processor,
+    scheduler,
+    startWorkers() {
+      if (!processor || !scheduler) {
+        logger.warn("workers not started: GitHub App is not configured");
+        return;
+      }
+      processor.start();
+      scheduler.start();
+    },
     async close() {
+      scheduler?.stop();
+      await processor?.stop();
       await http.close();
       closeDatabase(db);
     },

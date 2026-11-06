@@ -11,14 +11,33 @@ The full requirements are in [SPEC.md](SPEC.md).
 | Milestone                    | Scope                                                                                                                               | State       |
 | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | ----------- |
 | 1 — Foundation               | project setup, SQLite + migrations, GitHub App auth, configuration, OpenCode connection, workspaces, health checks, logging, Docker | ✅ done     |
-| 2 — Discovery and approval   | scheduler, webhooks, job queue, issue analysis, proposals, `/ai` commands                                                           | not started |
+| 2 — Discovery and approval   | polling scheduler, job queue, label gate, issue analysis, proposals, `/ai` commands, status labels                                  | ✅ done     |
 | 3 — Implementation           | worktree sessions, checks, commits, PRs                                                                                             | not started |
 | 4 — Review loop and features | review iterations, merge detection, feature proposals, recovery                                                                     | not started |
+
+## How to use it on GitHub
+
+1. A maintainer (listed in `github.authorized_users`) adds the label **`ai-allowed`**
+   to an issue. Labels added by anyone else are ignored.
+2. Within ~5 minutes the maintainer bot picks it up (oldest first, at most
+   `issue_batch_size` per repository at a time), analyses it with the read-only
+   agent and posts a **proposal** comment (v1, v2, …).
+3. A maintainer replies on the issue (first line of the comment):
+   - `/ai approve` — approves the **current** proposal version; it is queued for
+     implementation (Milestone 3).
+   - `/ai reject` — declines; nothing is implemented.
+   - `/ai revise <what to change>` — new analysis with your guidance, new version.
+4. Editing the issue (title/body) triggers a new analysis and voids earlier
+   approvals. Removing `ai-allowed` or closing the issue stops the work.
+
+Status labels (set by the bot, display only): `ai:queued`, `ai:running`,
+`ai:waiting-for-review`. Commands from non-maintainers are ignored silently.
+The bot never merges.
 
 ## Architecture
 
 ```text
-GitHub ──webhooks──▶ reverse proxy/tunnel ──▶ orchestrator (Docker, this repo)
+GitHub ◀──poll every 5 min (REST, GitHub App)── orchestrator (Docker, this repo)
                                                 │  SQLite: tasks, proposals, decisions, jobs, audit log
                                                 │  git: bare clones + one worktree per task
                                                 ▼
@@ -49,12 +68,15 @@ src/
   database/             schema, migrations, repository sync, task transitions, kill switch
   github/app.ts         GitHub App auth, installation lookup, scoped tokens, access checks
   opencode/client.ts    OpenCode connection (@opencode/client), session permissions
-  orchestrator/         task state machine
+  orchestrator/         state machine, discovery/sync, analysis, approvals, scheduler, prompts
+  workers/              SQLite job queue and processor
   workspace/            git runner and bare-clone/worktree manager
   http/server.ts        /healthz and /readyz
   health.ts             readiness aggregation (cached external checks)
 config/repositories.example.yaml
+prompts/                    agent prompt templates
 scripts/opencode-smoke.ts   manual end-to-end check against the real OpenCode server
+scripts/analysis-dry-run.ts manual issue analysis on a local checkout (posts nothing)
 tests/                      unit and integration tests (vitest)
 ```
 
@@ -107,15 +129,14 @@ Each session additionally receives the deny-by-default rules in
 ### GitHub App
 
 1. github.com → Settings → Developer settings → GitHub Apps → **New GitHub App**.
-2. Webhook: leave inactive until Milestone 2 (needs a public HTTPS URL).
+2. Webhook: leave **inactive** — the maintainer polls GitHub instead.
 3. Repository permissions — exactly these, nothing else:
    - Contents: **Read and write**
    - Issues: **Read and write**
    - Pull requests: **Read and write**
    - Metadata: Read-only
      Never grant Administration or Workflows; `/readyz` fails if they are granted.
-4. Events (Milestone 2): Issues, Issue comment, Pull request, Pull request review,
-   Pull request review comment.
+4. Events: none needed (no webhook).
 5. "Only on this account" → Create. Note the **App ID**, generate a **private key**.
 6. **Install App** → _Only select repositories_ → the configured repositories.
 7. Put the App ID and the key into `.env` (see `.env.example`), then delete the
@@ -143,7 +164,6 @@ All secrets live in `.env` and nowhere else.
 | `GITHUB_APP_ID`                                                  | for readiness | —              | GitHub App ID.                                                     |
 | `GITHUB_APP_PRIVATE_KEY`                                         | for readiness | —              | App private key, one line with `\n`.                               |
 | `GITHUB_APP_PRIVATE_KEY_PATH`                                    | alternative   | —              | Path to a PEM file instead of the inline key.                      |
-| `GITHUB_WEBHOOK_SECRET`                                          | Milestone 2   | —              | Webhook signature secret.                                          |
 | `OPENCODE_SERVER_USERNAME`                                       | no            | `opencode`     | OpenCode basic-auth user.                                          |
 | `OPENCODE_SERVER_PASSWORD`                                       | yes           | —              | OpenCode basic-auth password.                                      |
 | `MAINTAINER_PAUSED`                                              | no            | `false`        | Kill switch that cannot be lifted at runtime.                      |
@@ -157,8 +177,11 @@ repository you can set `commands` (test, lint, build, format, typecheck),
 `opencode` overrides (agents, model) and free-text `instructions`. See
 [config/repositories.example.yaml](config/repositories.example.yaml).
 
-`github.trusted_issue_authors` (default: `authorized_users`) limits which
-authors' issues are analysed automatically — important for public repositories.
+`github.authorized_users` are the maintainers; `github.allowed_label`
+(default `ai-allowed`) is the label that enables an issue. Because only
+maintainer-labelled issues reach the model, public repositories are safe to use.
+`discovery.poll_interval_seconds` (default 300) sets the polling interval;
+`discovery.schedule` adds a daily full run (default 08:00).
 
 ## Operations
 
@@ -171,8 +194,8 @@ authors' issues are analysed automatically — important for public repositories
 | Status                                        | `docker compose exec maintainer node dist/cli.js status`         |
 | Logs (JSON)                                   | `docker compose logs -f maintainer`                              |
 
-Only the webhook route will ever be exposed publicly (Milestone 2). Never expose
-`/readyz` or the OpenCode API to the internet.
+Nothing needs to be exposed to the internet (GitHub is polled). Never expose
+`/readyz` or the OpenCode API publicly.
 
 ## Development
 
@@ -204,4 +227,13 @@ GitHub/OpenCode are mocked at the HTTP level.
   (deny-by-default, no external directories, no MCP/web tools), not by an OS
   sandbox.
 - **Structured output.** OpenCode 2.x has no JSON-schema response mode; answers
-  are requested as JSON and validated with zod before use (Milestone 2).
+  are requested as JSON and validated with zod before use (up to 3 attempts
+  with feedback).
+- **Polling instead of webhooks.** There is no public HTTPS endpoint, so GitHub is
+  polled every 5 minutes (configurable). Reactions take up to one interval;
+  nothing is exposed to the internet. `GITHUB_WEBHOOK_SECRET` is unused.
+- **Label gate.** Issues are processed only after a maintainer adds
+  `ai-allowed` (decided with the project owner); the spec processes all open
+  issues.
+- **Approval with open questions.** A valid proposal with a plan can be approved
+  even if it lists open questions; approving accepts the plan as written.

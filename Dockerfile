@@ -32,6 +32,7 @@ COPY --from=build /app/package.json ./
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/src/database/migrations ./src/database/migrations
+COPY prompts ./prompts
 # Runs as the image's "node" user (uid 1000) so files in bind mounts belong to the host user.
 USER node
 EXPOSE 8787

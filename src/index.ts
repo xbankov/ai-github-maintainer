@@ -16,6 +16,7 @@ async function main(): Promise<void> {
   }
 
   const logger = createLogger(config.env.LOG_LEVEL);
+  for (const warning of config.warnings) logger.warn(warning);
   logger.info(
     {
       repositories: config.file.repositories.map(
@@ -49,6 +50,7 @@ async function main(): Promise<void> {
   process.on("unhandledRejection", (err) => logger.error({ err }, "unhandled promise rejection"));
 
   await app.http.listen({ host: config.env.HTTP_HOST, port: config.env.HTTP_PORT });
+  app.startWorkers();
 
   // Report dependency status once at start-up (does not block serving /healthz).
   const report = await app.health.report(true);

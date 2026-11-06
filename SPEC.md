@@ -1,5 +1,30 @@
 # AI GitHub Maintainer — Implementation Specification
 
+## Amendments (agreed with the project owner, 2026-11-06)
+
+These decisions override the corresponding parts of this specification.
+
+1. **Polling instead of webhooks** (§2.1, §2.5, §4 "Webhook Receiver", §8, §9).
+   The server has no public HTTPS endpoint. GitHub is polled through the GitHub
+   App every 5 minutes (`discovery.poll_interval_seconds`) plus the daily run.
+   There is no webhook receiver, no webhook secret and nothing exposed to the
+   internet; the GitHub App's webhook stays inactive. The `events` table records
+   processed command comments for idempotency instead of webhook deliveries.
+2. **Label gate** (§2.1). Only open issues to which a maintainer
+   (`github.authorized_users`) added the label `ai-allowed` are processed.
+   Labels added by anyone else are ignored. Removing the label or closing the
+   issue stops work that has not reached a pull request.
+3. **One issue at a time** (§2.1, §13). `discovery.issue_batch_size` defaults
+   to 1 per repository and `limits.max_parallel_jobs` to 1 overall.
+4. **Status labels.** The bot shows `ai:queued`, `ai:running` and
+   `ai:waiting-for-review` on issues (display only; the database is the source
+   of truth).
+5. **OpenCode client** (§3). OpenCode 2.x is used through the official
+   `@opencode/client` package; `@opencode-ai/sdk` 1.x targets the OpenCode 1.x API.
+6. **Approval with open questions** (§2.2). A valid proposal with an
+   implementation plan may be approved even if it lists open questions;
+   approving accepts the plan as written.
+
 ## 1. Project Goal
 
 Build a reusable, autonomous AI software-maintenance system that manages multiple GitHub repositories.

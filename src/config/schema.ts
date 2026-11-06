@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { STATUS_LABEL_NAMES } from "../github/issues.js";
 
 /**
  * Repository configuration (config/repositories.yaml).
@@ -55,12 +56,21 @@ export const configSchema = z
     repositories: z.array(repositorySchema).min(1),
     github: z
       .object({
+        /** Maintainers: may enable issues (allowed_label) and use /ai commands. */
         authorized_users: z.array(ghName).min(1),
         /**
-         * Only issues opened by these users are analysed automatically.
-         * Defaults to authorized_users. Protects public repositories from
-         * strangers' issue text being fed to the model.
+         * An issue is processed only after a maintainer adds this label.
+         * Labels added by anyone else are ignored.
          */
+        allowed_label: z
+          .string()
+          .min(1)
+          .default("ai-allowed")
+          .refine(
+            (l) => !STATUS_LABEL_NAMES.some((s) => s.toLowerCase() === l.toLowerCase()),
+            "must not be one of the bot-managed status labels",
+          ),
+        /** Deprecated (replaced by allowed_label); accepted and ignored with a warning. */
         trusted_issue_authors: z.array(ghName).optional(),
         proposal_label: z.string().min(1).default("ai-proposal"),
         api_url: z.url().default("https://api.github.com"),
@@ -70,6 +80,8 @@ export const configSchema = z
       .object({
         schedule: z.string().min(1).default("0 8 * * *"),
         timezone: z.string().min(1).default("Europe/Berlin"),
+        /** How often GitHub is polled for changes (replaces webhooks). */
+        poll_interval_seconds: z.number().int().min(60).default(300),
         issue_batch_size: z.number().int().min(1).max(20).default(3),
         feature_suggestions: z.number().int().min(0).max(10).default(3),
       })
@@ -77,6 +89,7 @@ export const configSchema = z
       .default({
         schedule: "0 8 * * *",
         timezone: "Europe/Berlin",
+        poll_interval_seconds: 300,
         issue_batch_size: 3,
         feature_suggestions: 3,
       }),
@@ -98,6 +111,10 @@ export const configSchema = z
         max_implementation_retries: z.number().int().min(0).default(3),
         max_concurrent_implementations: z.number().int().min(1).default(1),
         task_timeout_minutes: z.number().int().min(1).default(60),
+        /** Timeout for one issue analysis by the agent. */
+        analysis_timeout_minutes: z.number().int().min(1).default(15),
+        /** Jobs (analyses, syncs) running at the same time across all repositories. */
+        max_parallel_jobs: z.number().int().min(1).max(4).default(1),
       })
       .strict()
       .default({
@@ -105,6 +122,8 @@ export const configSchema = z
         max_implementation_retries: 3,
         max_concurrent_implementations: 1,
         task_timeout_minutes: 60,
+        analysis_timeout_minutes: 15,
+        max_parallel_jobs: 1,
       }),
   })
   .strict()

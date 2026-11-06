@@ -20,9 +20,9 @@ export interface AppConfig {
   file: FileConfig;
   /** null when the GitHub App is not configured yet (the service still starts, but is not ready). */
   github: GitHubAppCredentials | null;
-  /** Effective list of users whose issues are analysed automatically. */
-  trustedIssueAuthors: string[];
   paths: { config: string; database: string; workspaceRoot: string };
+  /** Non-fatal configuration problems (e.g. deprecated keys), logged at start-up. */
+  warnings: string[];
 }
 
 function formatZodError(prefix: string, error: z.ZodError): ConfigError {
@@ -71,11 +71,17 @@ function loadGitHubCredentials(env: Env): GitHubAppCredentials | null {
 }
 
 export function buildAppConfig(env: Env, file: FileConfig, cwd = process.cwd()): AppConfig {
+  const warnings: string[] = [];
+  if (file.github.trusted_issue_authors) {
+    warnings.push(
+      "github.trusted_issue_authors is deprecated and ignored: issues are enabled by a maintainer adding github.allowed_label. Remove the key.",
+    );
+  }
   return {
+    warnings,
     env,
     file,
     github: loadGitHubCredentials(env),
-    trustedIssueAuthors: file.github.trusted_issue_authors ?? file.github.authorized_users,
     paths: {
       config: resolve(cwd, env.CONFIG_PATH),
       database: resolve(cwd, env.DATABASE_PATH),

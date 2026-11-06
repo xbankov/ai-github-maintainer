@@ -17,8 +17,8 @@ describe("repository configuration", () => {
     const raw = parse(readFileSync("config/repositories.example.yaml", "utf8"));
     const cfg = parseFileConfig(raw);
     expect(cfg.repositories.map((r) => r.id)).toEqual(["songbook", "home-server"]);
-    expect(cfg.github.authorized_users).toEqual(["xbankov"]);
-    expect(cfg.discovery.issue_batch_size).toBe(3);
+    expect(cfg.github.authorized_users).toEqual(["xbankov", "VladoBaca"]);
+    expect(cfg.discovery.issue_batch_size).toBe(1);
     expect(cfg.limits.max_review_iterations).toBe(5);
     expect(cfg.opencode.analysis_agent).toBe("maintainer-plan");
   });
@@ -85,14 +85,27 @@ describe("repository configuration", () => {
     });
   });
 
-  it("defaults trusted issue authors to authorized users", () => {
-    expect(testConfig().trustedIssueAuthors).toEqual(["xbankov"]);
+  it("rejects an allowed label that is a bot status label", () => {
+    expect(() =>
+      parseFileConfig({
+        ...baseFileConfig,
+        github: { authorized_users: ["xbankov"], allowed_label: "AI:Queued" },
+      }),
+    ).toThrow(/status labels/);
+  });
+
+  it("accepts the deprecated trusted_issue_authors key with a warning", () => {
     const cfg = testConfig({
-      file: {
-        github: { authorized_users: ["xbankov"], trusted_issue_authors: ["xbankov", "friend"] },
-      },
+      file: { github: { authorized_users: ["xbankov"], trusted_issue_authors: ["xbankov"] } },
     });
-    expect(cfg.trustedIssueAuthors).toEqual(["xbankov", "friend"]);
+    expect(cfg.warnings).toEqual([expect.stringContaining("deprecated")]);
+    expect(testConfig().warnings).toEqual([]);
+  });
+
+  it("defaults the allowed label and polling interval", () => {
+    const d = testConfig().file;
+    expect(d.github.allowed_label).toBe("ai-allowed");
+    expect(d.discovery.poll_interval_seconds).toBe(300);
   });
 });
 

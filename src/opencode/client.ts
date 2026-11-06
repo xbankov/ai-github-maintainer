@@ -88,8 +88,10 @@ export class OpenCode {
     });
   }
 
-  private timeout(ms = this.options.timeoutMs) {
-    return { signal: AbortSignal.timeout(ms) };
+  /** Request options: a timeout, optionally combined with a caller's abort signal. */
+  private timeout(ms = this.options.timeoutMs, signal?: AbortSignal) {
+    const timeout = AbortSignal.timeout(ms);
+    return { signal: signal ? AbortSignal.any([timeout, signal]) : timeout };
   }
 
   /** Reachability, credentials, server version and agent availability. */
@@ -150,14 +152,28 @@ export class OpenCode {
    * Sends a prompt and waits until the agent loop is idle.
    * Returns the text of the latest assistant message.
    */
-  async run(sessionId: string, text: string, timeoutMs: number): Promise<string> {
-    await this.client.session.prompt({ sessionID: sessionId, text }, this.timeout());
+  async run(
+    sessionId: string,
+    text: string,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    signal?.throwIfAborted();
+    await this.client.session.prompt(
+      { sessionID: sessionId, text },
+      this.timeout(undefined, signal),
+    );
     try {
-      await this.client.session.wait({ sessionID: sessionId }, this.timeout(timeoutMs));
+      await this.client.session.wait({ sessionID: sessionId }, this.timeout(timeoutMs, signal));
     } catch (err) {
-      await this.client.session.interrupt({ sessionID: sessionId }).catch(() => undefined);
+      // Stop the agent: on timeout or when the caller cancels.
+      await this.client.session
+        .interrupt({ sessionID: sessionId }, this.timeout())
+        .catch(() => undefined);
       throw new OpenCodeError(
-        `Agent did not finish within ${timeoutMs} ms: ${describeOpenCodeError(err, this.options.serverUrl)}`,
+        signal?.aborted
+          ? "Agent run cancelled"
+          : `Agent did not finish within ${timeoutMs} ms: ${describeOpenCodeError(err, this.options.serverUrl)}`,
       );
     }
     const messages = await this.client.session.context({ sessionID: sessionId }, this.timeout());
@@ -170,9 +186,18 @@ export class OpenCode {
   }
 
   /** Transient completion from the session context; does not change the session history. */
-  async generate(sessionId: string, prompt: string, timeoutMs: number): Promise<string> {
+  async generate(
+    sessionId: string,
+    prompt: string,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    signal?.throwIfAborted();
     return (
-      await this.client.session.generate({ sessionID: sessionId, prompt }, this.timeout(timeoutMs))
+      await this.client.session.generate(
+        { sessionID: sessionId, prompt },
+        this.timeout(timeoutMs, signal),
+      )
     ).text;
   }
 }
