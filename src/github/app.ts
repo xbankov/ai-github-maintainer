@@ -10,14 +10,20 @@ export const REQUIRED_PERMISSIONS = {
   issues: "write",
   pull_requests: "write",
   metadata: "read",
+  // Read CI results and logs of the bot's branches (tests run in GitHub Actions).
+  actions: "read",
+  checks: "read",
+  statuses: "read",
 } as const;
 
-/** Permissions the App must NOT have. Their presence makes the service unready. */
+/** Permissions that must never exceed read-only. */
+export const READ_ONLY_PERMISSIONS = ["actions", "checks", "statuses", "metadata"] as const;
+
+/** Permissions the App must NOT have at all. Their presence makes the service unready. */
 export const FORBIDDEN_PERMISSIONS = [
   "administration",
   "workflows",
   "secrets",
-  "actions",
   "environments",
   "organization_administration",
   "members",
@@ -60,6 +66,11 @@ export function checkAppPermissions(granted: Record<string, string>): string[] {
   for (const [perm, level] of Object.entries(REQUIRED_PERMISSIONS)) {
     if ((rank[granted[perm] ?? ""] ?? 0) < (rank[level] ?? 0)) {
       problems.push(`missing permission ${perm}:${level} (has ${granted[perm] ?? "none"})`);
+    }
+  }
+  for (const perm of READ_ONLY_PERMISSIONS) {
+    if (granted[perm] && granted[perm] !== "read") {
+      problems.push(`permission ${perm} must be read-only (has ${granted[perm]})`);
     }
   }
   for (const perm of FORBIDDEN_PERMISSIONS) {
@@ -148,6 +159,18 @@ export class GitHubApp {
     return data.id;
   }
 
+  /** The installation covering `repo`, with the permissions it has actually granted. */
+  async getInstallation(
+    repo: RepoRef,
+  ): Promise<{ id: number; permissions: Record<string, string> }> {
+    const { data } = await this.app.octokit.request("GET /repos/{owner}/{repo}/installation", {
+      owner: repo.owner,
+      repo: repo.name,
+    });
+    this.installationIds.set(key(repo), data.id);
+    return { id: data.id, permissions: data.permissions ?? {} };
+  }
+
   /** Octokit authenticated as the installation that covers `repo` (tokens refresh automatically). */
   async octokitFor(repo: RepoRef): Promise<Octokit> {
     return this.app.getInstallationOctokit(await this.getInstallationId(repo));
@@ -182,7 +205,12 @@ export class GitHubApp {
       const result: RepositoryCheck = { repo: key(repo), ok: false, problems: [], warnings: [] };
       results.push(result);
       try {
-        result.installationId = await this.getInstallationId(repo);
+        const installation = await this.getInstallation(repo);
+        result.installationId = installation.id;
+        // The installation must have accepted the App's permissions (e.g. after a permission change).
+        for (const problem of checkAppPermissions(installation.permissions)) {
+          result.problems.push(`installation: ${problem} (accept the App's updated permissions)`);
+        }
         const octokit = await this.octokitFor(repo);
         const { data } = await octokit.request("GET /repos/{owner}/{repo}", {
           owner: repo.owner,

@@ -14,11 +14,15 @@ const goodPermissions = {
   issues: "write",
   pull_requests: "write",
   metadata: "read",
+  actions: "read",
+  checks: "read",
+  statuses: "read",
 };
 
 function fakeGitHub(
   opts: {
     permissions?: Record<string, string>;
+    installationPermissions?: Record<string, string>;
     repos?: Record<string, { default_branch: string; private: boolean; archived?: boolean }>;
     visible?: string[];
   } = {},
@@ -39,7 +43,7 @@ function fakeGitHub(
     const inst = path.match(/^\/repos\/([^/]+\/[^/]+)\/installation$/);
     if (method === "GET" && inst && isJwt)
       return repos[inst[1]!]
-        ? { body: { id: 55 } }
+        ? { body: { id: 55, permissions: opts.installationPermissions ?? goodPermissions } }
         : { status: 404, body: { message: "Not Found" } };
     if (method === "POST" && path === "/app/installations/55/access_tokens" && isJwt) {
       const req = (body ?? {}) as { repositories?: string[]; permissions?: unknown };
@@ -144,6 +148,17 @@ describe("GitHub App", () => {
     ]);
   });
 
+  it("reports permissions the installation has not accepted yet", async () => {
+    const { actions: _a, checks: _c, ...withoutCi } = goodPermissions;
+    const mock = fakeGitHub({ installationPermissions: withoutCi });
+    const [songbook] = await makeApp(mock).checkRepositories(configured);
+    expect(songbook!.ok).toBe(false);
+    expect(songbook!.problems).toEqual([
+      "installation: missing permission actions:read (has none) (accept the App's updated permissions)",
+      "installation: missing permission checks:read (has none) (accept the App's updated permissions)",
+    ]);
+  });
+
   it("warns when the installation can see unconfigured repositories", async () => {
     const mock = fakeGitHub({
       visible: ["xbankov/songbook", "xbankov/home-server", "xbankov/private-diary"],
@@ -170,7 +185,14 @@ describe("App permission policy", () => {
     expect(checkAppPermissions({ ...goodPermissions, issues: "read" })).toEqual([
       "missing permission issues:write (has read)",
     ]);
-    expect(checkAppPermissions({ metadata: "read" })).toHaveLength(3);
+    expect(checkAppPermissions({ metadata: "read" })).toHaveLength(6);
+  });
+
+  it("allows CI access only as read-only", () => {
+    expect(checkAppPermissions({ ...goodPermissions, actions: "write", checks: "write" })).toEqual([
+      "permission actions must be read-only (has write)",
+      "permission checks must be read-only (has write)",
+    ]);
   });
 
   it("flags forbidden permissions such as administration and workflows", () => {

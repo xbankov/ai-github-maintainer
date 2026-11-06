@@ -135,7 +135,11 @@ Each session additionally receives the deny-by-default rules in
    - Issues: **Read and write**
    - Pull requests: **Read and write**
    - Metadata: Read-only
-     Never grant Administration or Workflows; `/readyz` fails if they are granted.
+   - Actions: **Read-only** (CI logs of the bot's branches)
+   - Checks: **Read-only**
+   - Commit statuses: **Read-only**
+     Never grant Administration or Workflows, or write access to Actions/Checks/Statuses;
+     `/readyz` fails if they are granted.
 4. Events: none needed (no webhook).
 5. "Only on this account" → Create. Note the **App ID**, generate a **private key**.
 6. **Install App** → _Only select repositories_ → the configured repositories.
